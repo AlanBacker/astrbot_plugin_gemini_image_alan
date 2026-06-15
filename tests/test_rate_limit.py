@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -165,8 +167,59 @@ class RateLimitStoreTests(unittest.IsolatedAsyncioTestCase):
                 )[0]
             )
 
+    async def test_private_user_and_group_have_independent_quota(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = RateLimitStore(Path(temp_dir))
+
+            allowed, _ = await store.reserve(
+                "A",
+                "private-success",
+                enabled=True,
+                minute_limit=10,
+                hour_limit=10,
+                day_limit=1,
+                now=5000,
+            )
+            self.assertTrue(allowed)
+            await store.finish("A", "private-success", successful=True, now=5000)
+
+            allowed, _ = await store.reserve(
+                "A",
+                "private-blocked",
+                enabled=True,
+                minute_limit=10,
+                hour_limit=10,
+                day_limit=1,
+                now=5001,
+            )
+            self.assertFalse(allowed)
+
+            allowed, message = await store.reserve(
+                "group:B",
+                "group-success",
+                enabled=True,
+                minute_limit=10,
+                hour_limit=10,
+                day_limit=1,
+                now=5001,
+            )
+            self.assertTrue(allowed, message)
+            await store.finish(
+                "group:B", "group-success", successful=True, now=5001
+            )
+
+            private_snapshot, _ = await store.snapshot("A", now=5002)
+            group_snapshot, _ = await store.snapshot("group:B", now=5002)
+            self.assertEqual(private_snapshot["day"], 1)
+            self.assertEqual(group_snapshot["day"], 1)
+
 
 class EntrypointCoverageTests(unittest.TestCase):
+    class _NullLogger:
+        @staticmethod
+        def info(*args, **kwargs):
+            pass
+
     @staticmethod
     def _plugin_method_harness(*method_names: str):
         source = Path("main.py").read_text(encoding="utf-8")
@@ -177,10 +230,18 @@ class EntrypointCoverageTests(unittest.TestCase):
             if isinstance(node, ast.ClassDef) and node.name == "GeminiImagePlugin"
         )
         methods = [
-            node
+            copy.deepcopy(node)
             for node in plugin_class.body
-            if isinstance(node, ast.FunctionDef) and node.name in method_names
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in method_names
         ]
+        for method in methods:
+            method.decorator_list = [
+                decorator
+                for decorator in method.decorator_list
+                if isinstance(decorator, ast.Name)
+                and decorator.id in {"staticmethod", "classmethod"}
+            ]
         harness = ast.ClassDef(
             name="PluginHarness",
             bases=[],
@@ -189,7 +250,11 @@ class EntrypointCoverageTests(unittest.TestCase):
             decorator_list=[],
         )
         ast.fix_missing_locations(harness)
-        namespace = {"Any": object}
+        namespace = {
+            "Any": object,
+            "AstrMessageEvent": object,
+            "logger": EntrypointCoverageTests._NullLogger(),
+        }
         exec(
             compile(
                 ast.Module(body=[harness], type_ignores=[]),
@@ -217,6 +282,27 @@ class EntrypointCoverageTests(unittest.TestCase):
 
         plugin.config["generate_config"]["max_requests_per_day"] = 20
         self.assertEqual(plugin._get_rate_limit_settings(), (True, 3, 30, 20))
+
+    def test_permissions_and_quota_follow_conversation_scope(self):
+        harness_class = self._plugin_method_harness(
+            "_check_permission", "_get_rate_limit_subject"
+        )
+        plugin = harness_class()
+        plugin.config = {
+            "permission_config": {
+                "mode": "whitelist",
+                "users": ["A"],
+                "groups": ["B"],
+            }
+        }
+
+        self.assertTrue(plugin._check_permission("A", ""))
+        self.assertFalse(plugin._check_permission("C", ""))
+        self.assertTrue(plugin._check_permission("A", "B"))
+        self.assertTrue(plugin._check_permission("C", "B"))
+        self.assertFalse(plugin._check_permission("A", "OTHER_GROUP"))
+        self.assertEqual(plugin._get_rate_limit_subject("A", ""), "A")
+        self.assertEqual(plugin._get_rate_limit_subject("A", "B"), "group:B")
 
     def test_command_and_llm_tool_both_reserve_quota(self):
         source = Path("main.py").read_text(encoding="utf-8")
@@ -254,6 +340,100 @@ class EntrypointCoverageTests(unittest.TestCase):
                 and isinstance(node.value.func, ast.Attribute)
             }
             self.assertIn("_reserve_rate_limit", awaited_methods)
+            called_methods = {
+                node.func.attr
+                for node in ast.walk(entrypoint)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+            }
+            self.assertIn("_get_rate_limit_subject", called_methods)
+
+    def test_quota_query_checks_permission_and_uses_conversation_subject(self):
+        source = Path("main.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        plugin_class = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == "GeminiImagePlugin"
+        )
+        status_command = next(
+            node
+            for node in plugin_class.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "rate_limit_status_command"
+        )
+        called_methods = {
+            node.func.attr
+            for node in ast.walk(status_command)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+        self.assertIn("_check_permission", called_methods)
+        self.assertIn("_get_rate_limit_subject", called_methods)
+        attribute_names = {
+            node.attr
+            for node in ast.walk(status_command)
+            if isinstance(node, ast.Attribute)
+        }
+        self.assertIn("perm_no_permission_reply", attribute_names)
+        self.assertIn("plain_result", called_methods)
+
+    def test_quota_query_denies_whitelisted_user_in_unlisted_group(self):
+        harness_class = self._plugin_method_harness(
+            "_check_permission",
+            "_get_event_user_id",
+            "_get_event_group_id",
+            "_positive_int",
+            "_as_bool",
+            "_get_rate_limit_settings",
+            "_get_rate_limit_subject",
+            "rate_limit_status_command",
+        )
+
+        class FakeRateLimitStore:
+            def __init__(self):
+                self.snapshot_called = False
+
+            async def snapshot(self, subject_id):
+                self.snapshot_called = True
+                return {}, ""
+
+        class FakeEvent:
+            unified_msg_origin = "fake-origin"
+            message_obj = type(
+                "MessageObject",
+                (),
+                {"group_id": "OTHER_GROUP", "sender": None},
+            )()
+
+            @staticmethod
+            def get_sender_id():
+                return "A"
+
+            @staticmethod
+            def plain_result(message):
+                return message
+
+        plugin = harness_class()
+        plugin.config = {
+            "permission_config": {
+                "mode": "whitelist",
+                "users": ["A"],
+                "groups": ["B"],
+            }
+        }
+        plugin.perm_no_permission_reply = "NO_PERMISSION"
+        plugin.rate_limit_store = FakeRateLimitStore()
+
+        async def collect_results():
+            return [
+                result
+                async for result in plugin.rate_limit_status_command(FakeEvent())
+            ]
+
+        results = asyncio.run(collect_results())
+        self.assertEqual(results, ["NO_PERMISSION"])
+        self.assertFalse(plugin.rate_limit_store.snapshot_called)
 
 
 if __name__ == "__main__":

@@ -109,7 +109,10 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
             return "❌ 无法获取当前消息上下文"
 
         request_user_id = plugin._get_event_user_id(event)
-        group_id = event.message_obj.group_id or ""
+        group_id = plugin._get_event_group_id(event)
+        rate_limit_subject_id = plugin._get_rate_limit_subject(
+            request_user_id, group_id
+        )
 
         # DEBUG: Log the values used for permission check
         logger.info(
@@ -183,7 +186,7 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
             f"{time.time()}{request_user_id}{event.unified_msg_origin}".encode()
         ).hexdigest()[:8]
         is_allowed, rate_msg, rate_limit_enabled = await plugin._reserve_rate_limit(
-            request_user_id, task_id
+            rate_limit_subject_id, task_id
         )
         if not is_allowed:
             return rate_msg
@@ -205,8 +208,8 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
                     aspect_ratio=ar,
                     resolution=res,
                     task_id=task_id,
-                    rate_limit_user_id=(
-                        request_user_id if rate_limit_enabled else None
+                    rate_limit_subject_id=(
+                        rate_limit_subject_id if rate_limit_enabled else None
                     ),
                     rate_limit_request_id=task_id if rate_limit_enabled else None,
                 )
@@ -214,7 +217,7 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
         except Exception:
             if rate_limit_enabled:
                 await plugin._finish_rate_limit_request(
-                    request_user_id, task_id, successful=False
+                    rate_limit_subject_id, task_id, successful=False
                 )
             raise
 
@@ -333,10 +336,10 @@ class GeminiImagePlugin(Star):
         self.perm_silent = perm_conf.get("silent_on_no_permission", False)
 
     def _check_permission(self, user_id: str, group_id: str = "") -> bool:
-        """检查权限"""
+        """按会话检查权限：群聊只看群列表，私聊只看用户列表。"""
         # 实时读取配置
         perm_conf = self.config.get("permission_config", {})
-        mode = perm_conf.get("mode", "disable").strip()
+        mode = str(perm_conf.get("mode", "disable")).strip().lower()
 
         if mode == "disable":
             return True
@@ -352,22 +355,18 @@ class GeminiImagePlugin(Star):
             f"[Gemini Image] Perm Check: mode={mode}, user={user_id}, lists={limit_users}, groups={limit_groups}, group_id={group_id}"
         )
 
-        if mode == "blacklist":
-            # 黑名单模式: 在名单内则禁止
-            if user_id in limit_users:
-                return False
-            if group_id and group_id in limit_groups:
-                return False
-            return True
+        if group_id:
+            subject_id = group_id
+            subject_list = limit_groups
+        else:
+            subject_id = user_id
+            subject_list = limit_users
 
-        elif mode == "whitelist":
-            # 白名单模式: 在名单内才允许
-            if user_id in limit_users:
-                return True
-            if group_id and group_id in limit_groups:
-                return True
-            # 不在白名单中 -> 禁止
-            return False
+        if mode == "blacklist":
+            return subject_id not in subject_list
+
+        if mode == "whitelist":
+            return subject_id in subject_list
 
         return True
 
@@ -468,6 +467,20 @@ class GeminiImagePlugin(Star):
         return str(user_id).strip()
 
     @staticmethod
+    def _get_event_group_id(event: AstrMessageEvent) -> str:
+        """获取群 ID；私聊返回空字符串。"""
+        message_obj = getattr(event, "message_obj", None)
+        return str(getattr(message_obj, "group_id", "") or "").strip()
+
+    @staticmethod
+    def _get_rate_limit_subject(user_id: str, group_id: str = "") -> str:
+        """群聊共享群额度，私聊使用用户额度。"""
+        normalized_group_id = str(group_id).strip()
+        if normalized_group_id:
+            return f"group:{normalized_group_id}"
+        return str(user_id).strip()
+
+    @staticmethod
     def _positive_int(value: Any, default: int) -> int:
         try:
             return max(1, int(value))
@@ -504,14 +517,14 @@ class GeminiImagePlugin(Star):
         return enabled, minute_limit, hour_limit, day_limit
 
     async def _reserve_rate_limit(
-        self, user_id: str, request_id: str
+        self, subject_id: str, request_id: str
     ) -> tuple[bool, str, bool]:
-        """统一预留额度，命令和 LLM 工具必须从这里进入。"""
+        """按群或私聊用户主体统一预留额度。"""
         enabled, minute_limit, hour_limit, day_limit = (
             self._get_rate_limit_settings()
         )
         is_allowed, message = await self.rate_limit_store.reserve(
-            user_id,
+            subject_id,
             request_id,
             enabled=enabled,
             minute_limit=minute_limit,
@@ -521,11 +534,11 @@ class GeminiImagePlugin(Star):
         return is_allowed, message, enabled
 
     async def _finish_rate_limit_request(
-        self, user_id: str, request_id: str, successful: bool
+        self, subject_id: str, request_id: str, successful: bool
     ) -> None:
         """成功发送图片才记账；失败只撤销占位。"""
         recorded = await self.rate_limit_store.finish(
-            user_id, request_id, successful=successful
+            subject_id, request_id, successful=successful
         )
         if successful and not recorded:
             logger.critical(
@@ -536,7 +549,7 @@ class GeminiImagePlugin(Star):
     async def generate_image_command(self, event: AstrMessageEvent):
         """生成图片指令"""
         user_id = self._get_event_user_id(event)
-        group_id = event.message_obj.group_id or ""
+        group_id = self._get_event_group_id(event)
 
         if not self._check_permission(user_id, group_id):
             # 权限不足
@@ -621,8 +634,9 @@ class GeminiImagePlugin(Star):
 
         # 生成任务 ID，并在真正创建生图任务前预留频率额度
         task_id = hashlib.md5(f"{time.time()}{user_id}".encode()).hexdigest()[:8]
+        rate_limit_subject_id = self._get_rate_limit_subject(user_id, group_id)
         is_allowed, rate_msg, rate_limit_enabled = await self._reserve_rate_limit(
-            user_id, task_id
+            rate_limit_subject_id, task_id
         )
         if not is_allowed:
             yield event.plain_result(rate_msg)
@@ -658,20 +672,28 @@ class GeminiImagePlugin(Star):
                     aspect_ratio=aspect_ratio,
                     resolution=resolution,
                     task_id=task_id,
-                    rate_limit_user_id=user_id if rate_limit_enabled else None,
+                    rate_limit_subject_id=(
+                        rate_limit_subject_id if rate_limit_enabled else None
+                    ),
                     rate_limit_request_id=task_id if rate_limit_enabled else None,
                 )
             )
         except Exception:
             if rate_limit_enabled:
                 await self._finish_rate_limit_request(
-                    user_id, task_id, successful=False
+                    rate_limit_subject_id, task_id, successful=False
                 )
             raise
 
     @filter.command("生图额度")
     async def rate_limit_status_command(self, event: AstrMessageEvent):
-        """查看当前用户成功生图次数和正在执行的任务。"""
+        """查看当前群或私聊用户的成功生图次数和正在执行的任务。"""
+        user_id = self._get_event_user_id(event)
+        group_id = self._get_event_group_id(event)
+        if not self._check_permission(user_id, group_id):
+            yield event.plain_result(self.perm_no_permission_reply)
+            return
+
         enabled, minute_limit, hour_limit, day_limit = (
             self._get_rate_limit_settings()
         )
@@ -679,14 +701,15 @@ class GeminiImagePlugin(Star):
             yield event.plain_result("⚠️ 当前生图频率限制未启用")
             return
 
-        user_id = self._get_event_user_id(event)
-        snapshot, error = await self.rate_limit_store.snapshot(user_id)
+        subject_id = self._get_rate_limit_subject(user_id, group_id)
+        snapshot, error = await self.rate_limit_store.snapshot(subject_id)
         if snapshot is None:
             yield event.plain_result(error)
             return
 
+        scope_label = "当前群" if group_id else "当前用户"
         yield event.plain_result(
-            "📊 生图额度（仅统计成功发送的图片）\n"
+            f"📊 {scope_label}生图额度（仅统计成功发送的图片）\n"
             f"最近1分钟: {snapshot['minute']}/{minute_limit}\n"
             f"最近1小时: {snapshot['hour']}/{hour_limit}\n"
             f"滚动24小时: {snapshot['day']}/{day_limit}\n"
@@ -945,7 +968,7 @@ class GeminiImagePlugin(Star):
         aspect_ratio: str = "1:1",
         resolution: str = "1K",
         task_id: str | None = None,
-        rate_limit_user_id: str | None = None,
+        rate_limit_subject_id: str | None = None,
         rate_limit_request_id: str | None = None,
     ):
         """异步生成图片并发送"""
@@ -1005,9 +1028,9 @@ class GeminiImagePlugin(Star):
                     return
 
                 await self.context.send_message(unified_msg_origin, chain)
-                if rate_limit_user_id and rate_limit_request_id:
+                if rate_limit_subject_id and rate_limit_request_id:
                     await self._finish_rate_limit_request(
-                        rate_limit_user_id,
+                        rate_limit_subject_id,
                         rate_limit_request_id,
                         successful=True,
                     )
@@ -1022,11 +1045,11 @@ class GeminiImagePlugin(Star):
             finally:
                 if (
                     not rate_limit_recorded
-                    and rate_limit_user_id
+                    and rate_limit_subject_id
                     and rate_limit_request_id
                 ):
                     await self._finish_rate_limit_request(
-                        rate_limit_user_id,
+                        rate_limit_subject_id,
                         rate_limit_request_id,
                         successful=False,
                     )

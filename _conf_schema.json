@@ -202,13 +202,13 @@
         "description": "用户列表",
         "type": "list",
         "default": [],
-        "hint": "填入用户ID (QQ号等)"
+        "hint": "填入私聊用户ID；仅控制私聊权限和私聊用户额度"
       },
       "groups": {
         "description": "群组列表",
         "type": "list",
         "default": [],
-        "hint": "填入群组ID"
+        "hint": "填入群组ID；群聊只检查群列表，群内所有成员共享该群额度"
       },
       "no_permission_reply": {
         "description": "无权限回复语",
