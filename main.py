@@ -11,6 +11,7 @@ import json
 import os
 import time
 from collections.abc import Coroutine
+from pathlib import Path
 from typing import Any
 
 from pydantic import Field
@@ -20,7 +21,7 @@ import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.event.filter import EventMessageType
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
@@ -28,6 +29,10 @@ from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.utils.io import download_image_by_url, save_temp_img
 
 from .gemini_generator import GeminiImageGenerator
+from .rate_limit import RateLimitStore
+
+
+PLUGIN_NAME = "astrbot_plugin_gemini_image"
 
 
 @pydantic_dataclass
@@ -101,19 +106,12 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
             )
             return "❌ 无法获取当前消息上下文"
 
-        # Enhanced User ID Extraction & Debugging
-        user_id = event.get_sender_id()
-        if not user_id and event.message_obj and event.message_obj.sender:
-            user_id = event.message_obj.sender.user_id
-        if not user_id:
-            user_id = event.unified_msg_origin
-
-        user_id = str(user_id).strip()
+        request_user_id = plugin._get_event_user_id(event)
         group_id = event.message_obj.group_id or ""
 
         # DEBUG: Log the values used for permission check
         logger.info(
-            f"[Gemini Permission] Tool Call - User: {user_id}, Group: {group_id}"
+            f"[Gemini Permission] Tool Call - User: {request_user_id}, Group: {group_id}"
         )
         if hasattr(plugin, "perm_users"):
             logger.info(
@@ -122,15 +120,19 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
 
         # Permission Check
         if hasattr(plugin, "_check_permission"):
-            if not plugin._check_permission(user_id, group_id):
-                logger.warning(f"[Gemini Permission] DENIED for User: {user_id}")
+            if not plugin._check_permission(request_user_id, group_id):
+                logger.warning(
+                    f"[Gemini Permission] DENIED for User: {request_user_id}"
+                )
                 # SYSTEM STOP INSTRUCTION
                 if plugin.perm_silent:
                     return "SYSTEM_NOTIFICATION: Permission denied. User unauthorized. EXECUTION STOPPED. Do NOT generate image. Do NOT reply to the user. END."
                 else:
                     return f"SYSTEM_NOTIFICATION: Permission denied. EXECUTION STOPPED. Reply to user: '{plugin.perm_no_permission_reply}'"
             else:
-                logger.info(f"[Gemini Permission] ALLOWED for User: {user_id}")
+                logger.info(
+                    f"[Gemini Permission] ALLOWED for User: {request_user_id}"
+                )
         else:
             logger.error(
                 "[Gemini Permission] Plugin instance missing _check_permission method"
@@ -150,32 +152,39 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
                     continue
 
                 ref = ref.strip().lower()
-                user_id = None
+                avatar_user_id = None
 
                 if ref == "self":
                     # 获取机器人自己的头像
-                    user_id = str(event.get_self_id())
+                    avatar_user_id = str(event.get_self_id())
                 elif ref == "sender":
                     # 获取发送者的头像
-                    user_id = str(event.get_sender_id() or event.unified_msg_origin)
+                    avatar_user_id = request_user_id
                 else:
                     # 作为QQ号处理
-                    user_id = ref
+                    avatar_user_id = ref
 
-                if user_id:
-                    avatar_data = await plugin.get_avatar(user_id)
+                if avatar_user_id:
+                    avatar_data = await plugin.get_avatar(avatar_user_id)
                     if avatar_data:
                         images_data.append((avatar_data, "image/jpeg"))
                         logger.info(
-                            f"[Gemini Image] 已添加用户 {user_id} 的头像作为参考图片"
+                            f"[Gemini Image] 已添加用户 {avatar_user_id} 的头像作为参考图片"
                         )
                     else:
-                        logger.warning(f"[Gemini Image] 无法获取用户 {user_id} 的头像")
+                        logger.warning(
+                            f"[Gemini Image] 无法获取用户 {avatar_user_id} 的头像"
+                        )
 
         # 生成任务 ID
         task_id = hashlib.md5(
-            f"{time.time()}{event.unified_msg_origin}".encode()
+            f"{time.time()}{request_user_id}{event.unified_msg_origin}".encode()
         ).hexdigest()[:8]
+        is_allowed, rate_msg, rate_limit_enabled = await plugin._reserve_rate_limit(
+            request_user_id, task_id
+        )
+        if not is_allowed:
+            return rate_msg
 
         # 记录任务摘要
         res = kwargs.get("resolution", plugin.default_resolution)
@@ -185,16 +194,27 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
             f"[Gemini Image] 任务摘要 [{task_id}] - 提示词: {prompt} | 预设: 无 | 参考图: {img_count}张 | 分辨率: {res} | 比例: {ar}"
         )
 
-        plugin.create_background_task(
-            plugin._generate_and_send_image_async(
-                prompt=prompt,
-                images_data=images_data or None,
-                unified_msg_origin=event.unified_msg_origin,
-                aspect_ratio=ar,
-                resolution=res,
-                task_id=task_id,
+        try:
+            plugin.create_background_task(
+                plugin._generate_and_send_image_async(
+                    prompt=prompt,
+                    images_data=images_data or None,
+                    unified_msg_origin=event.unified_msg_origin,
+                    aspect_ratio=ar,
+                    resolution=res,
+                    task_id=task_id,
+                    rate_limit_user_id=(
+                        request_user_id if rate_limit_enabled else None
+                    ),
+                    rate_limit_request_id=task_id if rate_limit_enabled else None,
+                )
             )
-        )
+        except Exception:
+            if rate_limit_enabled:
+                await plugin._finish_rate_limit_request(
+                    request_user_id, task_id, successful=False
+                )
+            raise
 
         mode = "图生图" if images_data else "文生图"
         return f"已启动{mode}任务"
@@ -238,8 +258,8 @@ class GeminiImagePlugin(Star):
         self.background_tasks: set[asyncio.Task] = set()
         self._generation_semaphore = asyncio.Semaphore(self.max_concurrent_generations)
 
-        # 频率限制 {user_id: [timestamp, ...]}
-        self.user_request_timestamps: dict[str, list[float]] = {}
+        self.data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
+        self.rate_limit_store = RateLimitStore(self.data_dir)
 
         # 注册工具到 LLM
         if self.enable_llm_tool:
@@ -280,10 +300,6 @@ class GeminiImagePlugin(Star):
         self.max_retry_attempts = generate_config.get("max_retry_attempts", 3)
         self.safety_settings = generate_config.get("safety_settings", "BLOCK_NONE")
         self.max_image_size_mb = generate_config.get("max_image_size_mb", 10)
-        self.enable_rate_limit = generate_config.get("enable_rate_limit", True)
-        self.max_requests_per_minute = generate_config.get("max_requests_per_minute", 3)
-        self.max_requests_per_hour = generate_config.get("max_requests_per_hour", 30)
-        self.max_requests_per_day = generate_config.get("max_requests_per_day", 100)
 
         # 验证并发配置
         max_concurrent = generate_config.get(
@@ -432,57 +448,91 @@ class GeminiImagePlugin(Star):
         default_base = "https://generativelanguage.googleapis.com"
         self.base_url = self._clean_base_url(api_config.get("base_url", default_base))
 
-    def _check_rate_limit(self, user_id: str) -> tuple[bool, str]:
-        """检查用户请求频率是否超限"""
-        if not getattr(self, "enable_rate_limit", True):
-            return True, ""
+    @staticmethod
+    def _get_event_user_id(event: AstrMessageEvent) -> str:
+        """获取稳定的请求用户 ID，命令和 LLM 工具共用。"""
+        user_id = event.get_sender_id()
+        if not user_id and event.message_obj and event.message_obj.sender:
+            user_id = event.message_obj.sender.user_id
+        if not user_id:
+            user_id = event.unified_msg_origin
+        return str(user_id).strip()
 
-        now = time.time()
-        timestamps = self.user_request_timestamps.setdefault(user_id, [])
+    @staticmethod
+    def _positive_int(value: Any, default: int) -> int:
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return default
 
-        # 保留最近一天的记录即可（24小时 = 86400秒）
-        valid_timestamps = [t for t in timestamps if now - t < 86400]
-        self.user_request_timestamps[user_id] = valid_timestamps
+    @staticmethod
+    def _as_bool(value: Any, default: bool = True) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+        return default
 
-        # 统计分钟、小时、天的请求数
-        count_minute = sum(1 for t in valid_timestamps if now - t < 60)
-        count_hour = sum(1 for t in valid_timestamps if now - t < 3600)
-        count_day = len(valid_timestamps)
+    def _get_rate_limit_settings(self) -> tuple[bool, int, int, int]:
+        """每次请求实时读取 WebUI 配置，无需重启插件。"""
+        generate_config = self.config.get("generate_config", {})
+        enabled = self._as_bool(
+            generate_config.get("enable_rate_limit", True), default=True
+        )
+        minute_limit = self._positive_int(
+            generate_config.get("max_requests_per_minute", 3), 3
+        )
+        hour_limit = self._positive_int(
+            generate_config.get("max_requests_per_hour", 30), 30
+        )
+        day_limit = self._positive_int(
+            generate_config.get("max_requests_per_day", 100), 100
+        )
+        return enabled, minute_limit, hour_limit, day_limit
 
-        if count_minute >= getattr(self, "max_requests_per_minute", 3):
-            return (
-                False,
-                f"❌ 请求过于频繁，请稍后再试 (每分钟限 {self.max_requests_per_minute} 次)",
+    async def _reserve_rate_limit(
+        self, user_id: str, request_id: str
+    ) -> tuple[bool, str, bool]:
+        """统一预留额度，命令和 LLM 工具必须从这里进入。"""
+        enabled, minute_limit, hour_limit, day_limit = (
+            self._get_rate_limit_settings()
+        )
+        is_allowed, message = await self.rate_limit_store.reserve(
+            user_id,
+            request_id,
+            enabled=enabled,
+            minute_limit=minute_limit,
+            hour_limit=hour_limit,
+            day_limit=day_limit,
+        )
+        return is_allowed, message, enabled
+
+    async def _finish_rate_limit_request(
+        self, user_id: str, request_id: str, successful: bool
+    ) -> None:
+        """成功发送图片才记账；失败只撤销占位。"""
+        recorded = await self.rate_limit_store.finish(
+            user_id, request_id, successful=successful
+        )
+        if successful and not recorded:
+            logger.critical(
+                "[Gemini Image] 图片已发送，但限额记录写入失败；已自动停止后续生图"
             )
-        if count_hour >= getattr(self, "max_requests_per_hour", 30):
-            return (
-                False,
-                f"❌ 请求过于频繁，请稍后再试 (每小时限 {self.max_requests_per_hour} 次)",
-            )
-        if count_day >= getattr(self, "max_requests_per_day", 100):
-            return (
-                False,
-                f"❌ 请求过于频繁，请明天再试 (每天限 {self.max_requests_per_day} 次)",
-            )
-
-        valid_timestamps.append(now)
-        return True, ""
 
     @filter.command("生图")
     async def generate_image_command(self, event: AstrMessageEvent):
         """生成图片指令"""
-        user_id = str(event.get_sender_id() or event.unified_msg_origin)
+        user_id = self._get_event_user_id(event)
         group_id = event.message_obj.group_id or ""
 
         if not self._check_permission(user_id, group_id):
             # 权限不足
             if not self.perm_silent:
                 yield event.plain_result(self.perm_no_permission_reply)
-            return
-
-        is_allowed, rate_msg = self._check_rate_limit(user_id)
-        if not is_allowed:
-            yield event.plain_result(rate_msg)
             return
 
         masked_uid = (
@@ -560,6 +610,15 @@ class GeminiImagePlugin(Star):
         # 获取参考图片
         images_data = await self._get_reference_images_for_command(event)
 
+        # 生成任务 ID，并在真正创建生图任务前预留频率额度
+        task_id = hashlib.md5(f"{time.time()}{user_id}".encode()).hexdigest()[:8]
+        is_allowed, rate_msg, rate_limit_enabled = await self._reserve_rate_limit(
+            user_id, task_id
+        )
+        if not is_allowed:
+            yield event.plain_result(rate_msg)
+            return
+
         # 发送确认
         msg = "已开始生图任务"
         if images_data:
@@ -573,9 +632,6 @@ class GeminiImagePlugin(Star):
 
         yield event.plain_result(msg)
 
-        # 生成任务 ID
-        task_id = hashlib.md5(f"{time.time()}{user_id}".encode()).hexdigest()[:8]
-
         # 记录任务摘要
         preset_name = matched_preset if matched_preset else "无"
         img_count = len(images_data) if images_data else 0
@@ -584,15 +640,48 @@ class GeminiImagePlugin(Star):
         )
 
         # 创建后台任务
-        self.create_background_task(
-            self._generate_and_send_image_async(
-                prompt=prompt,
-                images_data=images_data or None,
-                unified_msg_origin=event.unified_msg_origin,
-                aspect_ratio=aspect_ratio,
-                resolution=resolution,
-                task_id=task_id,
+        try:
+            self.create_background_task(
+                self._generate_and_send_image_async(
+                    prompt=prompt,
+                    images_data=images_data or None,
+                    unified_msg_origin=event.unified_msg_origin,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    task_id=task_id,
+                    rate_limit_user_id=user_id if rate_limit_enabled else None,
+                    rate_limit_request_id=task_id if rate_limit_enabled else None,
+                )
             )
+        except Exception:
+            if rate_limit_enabled:
+                await self._finish_rate_limit_request(
+                    user_id, task_id, successful=False
+                )
+            raise
+
+    @filter.command("生图额度")
+    async def rate_limit_status_command(self, event: AstrMessageEvent):
+        """查看当前用户成功生图次数和正在执行的任务。"""
+        enabled, minute_limit, hour_limit, day_limit = (
+            self._get_rate_limit_settings()
+        )
+        if not enabled:
+            yield event.plain_result("⚠️ 当前生图频率限制未启用")
+            return
+
+        user_id = self._get_event_user_id(event)
+        snapshot, error = await self.rate_limit_store.snapshot(user_id)
+        if snapshot is None:
+            yield event.plain_result(error)
+            return
+
+        yield event.plain_result(
+            "📊 生图额度（仅统计成功发送的图片）\n"
+            f"最近1分钟: {snapshot['minute']}/{minute_limit}\n"
+            f"最近1小时: {snapshot['hour']}/{hour_limit}\n"
+            f"滚动24小时: {snapshot['day']}/{day_limit}\n"
+            f"正在执行: {snapshot['pending']}"
         )
 
     async def _fetch_images_from_event(
@@ -847,6 +936,8 @@ class GeminiImagePlugin(Star):
         aspect_ratio: str = "1:1",
         resolution: str = "1K",
         task_id: str | None = None,
+        rate_limit_user_id: str | None = None,
+        rate_limit_request_id: str | None = None,
     ):
         """异步生成图片并发送"""
         if not task_id:
@@ -859,6 +950,7 @@ class GeminiImagePlugin(Star):
         if aspect_ratio == "自动":
             final_ar = None
 
+        rate_limit_recorded = False
         async with self._generation_semaphore:
             try:
                 results, error = await self.generator.generate_image(
@@ -885,18 +977,32 @@ class GeminiImagePlugin(Star):
 
                 # 构建消息链
                 chain = MessageChain()
-                cached_urls = []
+                saved_image_count = 0
 
                 for img_bytes in results:
                     # 保存临时文件
                     try:
                         file_path = save_temp_img(img_bytes)
                         chain.file_image(file_path)
-                        cached_urls.append(f"file://{file_path}")
+                        saved_image_count += 1
                     except Exception as e:
                         logger.error(f"保存图片失败: {e}")
 
+                if saved_image_count == 0:
+                    await self.context.send_message(
+                        unified_msg_origin,
+                        MessageChain().message("❌ 生成的图片保存失败"),
+                    )
+                    return
+
                 await self.context.send_message(unified_msg_origin, chain)
+                if rate_limit_user_id and rate_limit_request_id:
+                    await self._finish_rate_limit_request(
+                        rate_limit_user_id,
+                        rate_limit_request_id,
+                        successful=True,
+                    )
+                    rate_limit_recorded = True
 
             except Exception as e:
                 logger.error(f"[Gemini Image] 任务失败: {e}", exc_info=True)
@@ -904,6 +1010,17 @@ class GeminiImagePlugin(Star):
                     unified_msg_origin,
                     MessageChain().message("❌ 生成过程中发生未知错误"),
                 )
+            finally:
+                if (
+                    not rate_limit_recorded
+                    and rate_limit_user_id
+                    and rate_limit_request_id
+                ):
+                    await self._finish_rate_limit_request(
+                        rate_limit_user_id,
+                        rate_limit_request_id,
+                        successful=False,
+                    )
 
     async def terminate(self):
         """卸载清理"""

@@ -132,25 +132,25 @@
       },
       "enable_rate_limit": {
         "description": "启用速率限制",
-        "hint": "开启后，将对用户的生图请求进行频率限制",
+        "hint": "开启后，命令和 LLM 自动调用都会受限；保存配置后立即生效",
         "type": "bool",
         "default": true
       },
       "max_requests_per_minute": {
         "description": "每分钟最大请求数",
-        "hint": "单个用户每分钟最多可以发起的图片生成请求数",
+        "hint": "单个用户最近 1 分钟内最多成功生成的图片请求数；执行中任务也会占位",
         "type": "int",
         "default": 3
       },
       "max_requests_per_hour": {
         "description": "每小时最大请求数",
-        "hint": "单个用户每小时最多可以发起的图片生成请求数",
+        "hint": "单个用户最近 1 小时内最多成功生成的图片请求数；执行中任务也会占位",
         "type": "int",
         "default": 30
       },
       "max_requests_per_day": {
         "description": "每天最大请求数",
-        "hint": "单个用户每天最多可以发起的图片生成请求数",
+        "hint": "单个用户滚动 24 小时内最多成功生成的图片请求数；记录持久化，重启不会清零",
         "type": "int",
         "default": 100
       },
