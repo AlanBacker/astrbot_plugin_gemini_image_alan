@@ -1,6 +1,6 @@
 # Gemini Image 插件（Alan 修复版）
 
-仓库：https://github.com/AlanBacker/astrbot_plugin_gemini_image
+仓库：https://github.com/AlanBacker/astrbot_plugin_gemini_image_alan
 
 ### 基于 Gemini 模型的图像生成插件，支持文生图和图生图，支持自然语言调用和预设提示词
 
