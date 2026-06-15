@@ -28,11 +28,13 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.utils.io import download_image_by_url, save_temp_img
 
+from .config_migration import migrate_legacy_config
 from .gemini_generator import GeminiImageGenerator
 from .rate_limit import RateLimitStore
 
 
-PLUGIN_NAME = "astrbot_plugin_gemini_image"
+PLUGIN_NAME = "astrbot_plugin_gemini_image_alan"
+LEGACY_PLUGIN_NAME = "astrbot_plugin_gemini_image"
 
 
 @pydantic_dataclass
@@ -239,6 +241,12 @@ class GeminiImagePlugin(Star):
         super().__init__(context)
         self.context = context
         self.config = config or AstrBotConfig()
+        if migrate_legacy_config(
+            self.config,
+            current_plugin_name=PLUGIN_NAME,
+            legacy_plugin_name=LEGACY_PLUGIN_NAME,
+        ):
+            logger.info("[Gemini Image] 已自动迁移原版插件配置")
 
         # 读取配置
         self._load_config()
@@ -258,7 +266,8 @@ class GeminiImagePlugin(Star):
         self.background_tasks: set[asyncio.Task] = set()
         self._generation_semaphore = asyncio.Semaphore(self.max_concurrent_generations)
 
-        self.data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
+        # Continue using the legacy data directory so quota history survives the rename.
+        self.data_dir = Path(StarTools.get_data_dir(LEGACY_PLUGIN_NAME))
         self.rate_limit_store = RateLimitStore(self.data_dir)
 
         # 注册工具到 LLM

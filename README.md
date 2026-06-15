@@ -1,18 +1,23 @@
-# Gemini Image 插件
+# Gemini Image 插件（Alan 修复版）
 
-![:name](https://count.getloli.com/@astrbot_plugin_gemini_image?name=astrbot_plugin_gemini_image&theme=miku&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
+仓库：https://github.com/AlanBacker/astrbot_plugin_gemini_image
 
 ### 基于 Gemini 模型的图像生成插件，支持文生图和图生图，支持自然语言调用和预设提示词
 
-> [!warning]
-> 本插件已停止维护！！！  
-> 请使用新的生图插件 `astrbot_plugin_image_generation` (通用生图)  
-> 新插件继承了本插件全部功能且更进一步  
-> [GitHub链接](https://github.com/railgun19457/astrbot_plugin_image_generation)  
+> [!important]
+> 本分叉版的内部插件名为 `astrbot_plugin_gemini_image_alan`，用于避免 AstrBot
+> 将它误识别为 Railgun 市场中的原版并提示降级更新。首次安装时会自动迁移旧版配置，
+> 限额历史数据也会继续沿用。
 
 ***
 > [!note]
 > 本插件需要 AstrBot 版本 >= v4.5.7
+
+### 从原版迁移
+
+1. 卸载旧插件时不要勾选删除配置和插件数据。
+2. 安装本仓库提供的 ZIP，并重启 AstrBot。
+3. 插件列表中应显示 `Gemini生图（Alan修复版）`，不再匹配 Railgun 的市场更新。
 
 ### 命令
 - `/生图 <提示词或预设名称> [额外提示词]`
