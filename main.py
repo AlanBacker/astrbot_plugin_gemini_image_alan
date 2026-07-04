@@ -20,7 +20,6 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
@@ -29,9 +28,9 @@ from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.utils.io import download_image_by_url, save_temp_img
 
 from .config_migration import migrate_legacy_config
+from .data_migration import migrate_legacy_data_dir
 from .gemini_generator import GeminiImageGenerator
 from .rate_limit import RateLimitStore
-
 
 PLUGIN_NAME = "astrbot_plugin_gemini_image_alan"
 LEGACY_PLUGIN_NAME = "astrbot_plugin_gemini_image"
@@ -135,9 +134,7 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
                 else:
                     return f"SYSTEM_NOTIFICATION: Permission denied. EXECUTION STOPPED. Reply to user: '{plugin.perm_no_permission_reply}'"
             else:
-                logger.info(
-                    f"[Gemini Permission] ALLOWED for User: {request_user_id}"
-                )
+                logger.info(f"[Gemini Permission] ALLOWED for User: {request_user_id}")
         else:
             logger.error(
                 "[Gemini Permission] Plugin instance missing _check_permission method"
@@ -269,8 +266,12 @@ class GeminiImagePlugin(Star):
         self.background_tasks: set[asyncio.Task] = set()
         self._generation_semaphore = asyncio.Semaphore(self.max_concurrent_generations)
 
-        # Continue using the legacy data directory so quota history survives the rename.
-        self.data_dir = Path(StarTools.get_data_dir(LEGACY_PLUGIN_NAME))
+        current_data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
+        legacy_data_dir = current_data_dir.parent / LEGACY_PLUGIN_NAME
+        if migrate_legacy_data_dir(current_data_dir, legacy_data_dir):
+            logger.info("[Gemini Image] 已自动迁移原版插件数据")
+
+        self.data_dir = current_data_dir
         self.rate_limit_store = RateLimitStore(self.data_dir)
 
         # 注册工具到 LLM
@@ -520,9 +521,7 @@ class GeminiImagePlugin(Star):
         self, subject_id: str, request_id: str
     ) -> tuple[bool, str, bool]:
         """按群或私聊用户主体统一预留额度。"""
-        enabled, minute_limit, hour_limit, day_limit = (
-            self._get_rate_limit_settings()
-        )
+        enabled, minute_limit, hour_limit, day_limit = self._get_rate_limit_settings()
         is_allowed, message = await self.rate_limit_store.reserve(
             subject_id,
             request_id,
@@ -694,9 +693,7 @@ class GeminiImagePlugin(Star):
             yield event.plain_result(self.perm_no_permission_reply)
             return
 
-        enabled, minute_limit, hour_limit, day_limit = (
-            self._get_rate_limit_settings()
-        )
+        enabled, minute_limit, hour_limit, day_limit = self._get_rate_limit_settings()
         if not enabled:
             yield event.plain_result("⚠️ 当前生图频率限制未启用")
             return

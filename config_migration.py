@@ -8,11 +8,7 @@ from typing import Any
 def _merge_config(defaults: dict[str, Any], legacy: dict[str, Any]) -> dict[str, Any]:
     merged = defaults.copy()
     for key, value in legacy.items():
-        if (
-            key in merged
-            and isinstance(merged[key], dict)
-            and isinstance(value, dict)
-        ):
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
             merged[key] = _merge_config(merged[key], value)
         else:
             merged[key] = value
