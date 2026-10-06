@@ -150,6 +150,12 @@
           "网页+图片搜索"
         ]
       },
+      "show_grounding_sources": {
+        "description": "显示参考来源",
+        "hint": "用到联网搜索时,是否在图片后附上参考来源链接。注意:Google 要求使用图片搜索时必须向用户展示来源网页链接,关闭后可能不符合其使用条款",
+        "type": "bool",
+        "default": true
+      },
       "max_concurrent_generations": {
         "description": "最大并发生成数",
         "hint": "同时生成图片的最大数量,防止资源耗尽",

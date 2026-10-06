@@ -253,6 +253,21 @@ class SearchGroundingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await generator.generate_image("cat"), ([b"img"], None, []))
 
+    def test_sources_are_only_sent_when_display_is_enabled(self):
+        module = ast.parse(Path("main.py").read_text(encoding="utf-8"))
+        guards = [
+            ast.unparse(node.test)
+            for node in ast.walk(module)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.Attribute)
+                and child.attr == "_format_grounding_sources"
+                for child in ast.walk(node)
+            )
+        ]
+
+        self.assertEqual(guards, ["sources and self.show_grounding_sources"])
+
     def test_sources_are_formatted_as_links(self):
         module = ast.parse(Path("main.py").read_text(encoding="utf-8"))
         plugin_class = next(

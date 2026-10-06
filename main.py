@@ -324,6 +324,9 @@ class GeminiImagePlugin(Star):
         self.default_resolution = generate_config.get("default_resolution", "1K")
         self.thinking_level = generate_config.get("thinking_level", "默认")
         self.search_grounding = generate_config.get("search_grounding", "关闭")
+        self.show_grounding_sources = self._as_bool(
+            generate_config.get("show_grounding_sources", True), default=True
+        )
         self.max_retry_attempts = generate_config.get("max_retry_attempts", 3)
         self.safety_settings = generate_config.get("safety_settings", "BLOCK_NONE")
         self.max_image_size_mb = generate_config.get("max_image_size_mb", 10)
@@ -1059,7 +1062,7 @@ class GeminiImagePlugin(Star):
                     return
 
                 # 使用了联网搜索时，随图片附上来源网页链接
-                if sources:
+                if sources and self.show_grounding_sources:
                     chain.message(self._format_grounding_sources(sources))
 
                 await self.context.send_message(unified_msg_origin, chain)

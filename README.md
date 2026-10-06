@@ -48,7 +48,7 @@
 - ✅ **LLM 集成**：可在对话中由 LLM 自动调用图像生成功能（支持图生图）。
 - ✅ **模型管理**：通过指令动态查看和切换可用的 Gemini 模型，支持 Nano Banana 2.1（`gemini-nano-banana-2.1`）。
 - ✅ **思考等级**：可为 Nano Banana 2.1 / Gemini 3.1 Flash Image 设置思考等级（minimal / medium / high），在出图质量与速度、费用之间取舍；JSON 预设也可单独指定。
-- ✅ **联网搜索**：支持 Google 网页搜索和图片搜索（Grounding），可按实时信息或真实物品的样子生图，并在图片后附上参考来源链接。
+- ✅ **联网搜索**：支持 Google 网页搜索和图片搜索（Grounding），可按实时信息或真实物品的样子生图，并可在图片后附上参考来源链接（可开关）。
 - ✅ **强大预设**：支持快速调用预定义模板，并可通过指令动态管理（增/删）。
 - ✅ **多 API Key 轮询**：支持配置多个 API Key，失败或限流时自动切换，提高可用性。
 - ✅ **失败重试**：在生成失败时自动进行重试。
@@ -78,6 +78,7 @@
 | `default_resolution`         | string  | `"1K"`                                        | 使用 `/生图` 命令时的默认分辨率 (仅部分模型支持)。                |
 | `thinking_level`             | string  | `"默认"`                                      | 思考等级 `minimal`/`medium`/`high`，仅支持的模型生效，见下方说明。 |
 | `search_grounding`           | string  | `"关闭"`                                      | 联网搜索：`关闭`/`网页搜索`/`图片搜索`/`网页+图片搜索`，见下方说明。 |
+| `show_grounding_sources`     | boolean | `true`                                        | 用到联网搜索时，是否在图片后附上参考来源链接。                    |
 | `max_concurrent_generations` | number  | `3`                                           | 允许同时进行的最大图片生成任务数。                                |
 | `max_requests_per_minute`    | number  | `3`                                           | 当前群或私聊用户每分钟的最大请求次数。                            |
 | `max_requests_per_hour`      | number  | `30`                                          | 当前群或私聊用户滚动一小时的最大成功生图次数。                    |
@@ -108,7 +109,7 @@
 | `gemini-3-pro-image-preview`                    | ✅       | ❌       |
 | 其他模型（含 Flash Lite）                       | ❌       | ❌       |
 
-- 用到搜索时，插件会在图片后附上参考来源链接。使用图片搜索时，Google 要求必须向用户展示来源网页链接。
+- 用到搜索时，插件会在图片后附上参考来源链接，可通过 `show_grounding_sources` 关闭。使用图片搜索时，Google 要求必须向用户展示来源网页链接，关闭后可能不符合其使用条款。
 - 图片搜索不能用于搜索人物。
 - 当前模型不支持所选的搜索类型时会自动忽略，并在日志中提示。
 - 仅 `gemini` 接口支持；搜索可能额外计费，以 Google 官方价格为准。
