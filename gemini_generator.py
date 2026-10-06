@@ -32,6 +32,23 @@ def get_supported_thinking_levels(model: str) -> tuple[str, ...]:
     return ()
 
 
+# 联网搜索类型对应的 searchTypes 字段和显示名称
+SEARCH_TYPE_FIELDS = {"web": "webSearch", "image": "imageSearch"}
+SEARCH_TYPE_NAMES = {"web": "网页搜索", "image": "图片搜索"}
+
+
+def get_supported_search_types(model: str) -> tuple[str, ...]:
+    """返回模型可用的联网搜索类型，不支持联网搜索时返回空元组"""
+    model = model.lower()
+    if "lite" in model:
+        return ()
+    if "nano-banana-2" in model or "gemini-3.1-flash-image" in model:
+        return ("web", "image")
+    if "gemini-3" in model or "nano-banana-pro" in model:
+        return ("web",)
+    return ()
+
+
 class GeminiImageGenerator:
     """Gemini 图像生成器"""
 
@@ -45,6 +62,7 @@ class GeminiImageGenerator:
         max_retry_attempts: int = 3,
         proxy: str | None = None,
         safety_settings: str = "BLOCK_NONE",
+        search_types: tuple[str, ...] = (),
     ):
         self.api_keys = api_keys if api_keys else []
         self.current_key_index = 0
@@ -55,6 +73,7 @@ class GeminiImageGenerator:
         self.max_retry_attempts = max(1, min(max_retry_attempts, 10))
         self.proxy = proxy
         self.safety_settings = safety_settings
+        self.search_types = tuple(search_types)
         self._session: aiohttp.ClientSession | None = None
 
     def _get_current_api_key(self) -> str:
@@ -164,16 +183,17 @@ class GeminiImageGenerator:
         image_size: str | None = None,
         task_id: str | None = None,
         thinking_level: str | None = None,
-    ) -> tuple[list[bytes] | None, str | None]:
-        """生成图片"""
+    ) -> tuple[list[bytes] | None, str | None, list[tuple[str, str]]]:
+        """生成图片，返回 (图片列表, 错误信息, 联网搜索来源 [(标题, 链接)])"""
         logger.debug(
-            f"[Gemini Image] generate_image params - Model: {self.model}, Aspect: {aspect_ratio}, Size: {image_size}, Thinking: {thinking_level}, TaskID: {task_id}"
+            f"[Gemini Image] generate_image params - Model: {self.model}, Aspect: {aspect_ratio}, Size: {image_size}, Thinking: {thinking_level}, Search: {self.search_types}, TaskID: {task_id}"
         )
         if not self.api_keys:
-            return None, "未配置 API Key"
+            return None, "未配置 API Key", []
 
         prefix = f"[{task_id}] " if task_id else ""
         thinking_level = self._resolve_thinking_level(thinking_level, prefix)
+        search_types = self._resolve_search_types(prefix)
 
         # 转换所有图片格式
         converted_images = []
@@ -199,6 +219,7 @@ class GeminiImageGenerator:
                 image_size,
                 task_id,
                 thinking_level,
+                search_types,
             )
 
             if result[0] is not None:
@@ -216,7 +237,29 @@ class GeminiImageGenerator:
                     wait_time = min(2**round_index, 10)
                     await asyncio.sleep(wait_time)
 
-        return None, f"重试失败: {last_error}"
+        return None, f"重试失败: {last_error}", []
+
+    def _resolve_search_types(self, prefix: str = "") -> tuple[str, ...]:
+        """按当前接口和模型过滤联网搜索类型，不支持的类型不传"""
+        if not self.search_types:
+            return ()
+
+        if self.api_type != "gemini":
+            logger.warning(
+                f"[Gemini Image] {prefix}{self.api_type} 接口不支持联网搜索，已忽略该设置"
+            )
+            return ()
+
+        supported = get_supported_search_types(self.model)
+        search_types = tuple(t for t in self.search_types if t in supported)
+        dropped = [
+            SEARCH_TYPE_NAMES[t] for t in self.search_types if t not in supported
+        ]
+        if dropped:
+            logger.warning(
+                f"[Gemini Image] {prefix}模型 {self.model} 不支持{'/'.join(dropped)}，已忽略"
+            )
+        return search_types
 
     def _resolve_thinking_level(
         self, thinking_level: str | None, prefix: str = ""
@@ -248,21 +291,29 @@ class GeminiImageGenerator:
         image_size: str | None,
         task_id: str | None = None,
         thinking_level: str | None = None,
-    ) -> tuple[list[bytes] | None, str | None]:
+        search_types: tuple[str, ...] = (),
+    ) -> tuple[list[bytes] | None, str | None, list[tuple[str, str]]]:
         """使用当前 API Key 尝试生成图片"""
         if self.api_type == "gemini":
             return await self._generate_gemini(
-                prompt, images_data, aspect_ratio, image_size, task_id, thinking_level
+                prompt,
+                images_data,
+                aspect_ratio,
+                image_size,
+                task_id,
+                thinking_level,
+                search_types,
             )
         elif self.api_type == "zai":
             # Zai 格式没有思考等级参数
-            return await self._generate_zai(
+            images, error = await self._generate_zai(
                 prompt, images_data, aspect_ratio, image_size, task_id
             )
         else:
-            return await self._generate_openai(
+            images, error = await self._generate_openai(
                 prompt, images_data, aspect_ratio, image_size, task_id, thinking_level
             )
+        return images, error, []
 
     def _log_payload(self, payload: dict, provider: str):
         """记录请求负载，隐藏过长的 Base64 数据"""
@@ -661,31 +712,38 @@ class GeminiImageGenerator:
         image_size: str | None,
         task_id: str | None = None,
         thinking_level: str | None = None,
-    ) -> tuple[list[bytes] | None, str | None]:
+        search_types: tuple[str, ...] = (),
+    ) -> tuple[list[bytes] | None, str | None, list[tuple[str, str]]]:
         """使用 Gemini 格式 API 生成图片"""
         prefix = f"[{task_id}] " if task_id else ""
 
         try:
             payload = self._build_gemini_payload(
-                prompt, images_data, aspect_ratio, image_size, thinking_level
+                prompt,
+                images_data,
+                aspect_ratio,
+                image_size,
+                thinking_level,
+                search_types,
             )
 
             session = self._get_session()
             response_data = await self._make_gemini_request(session, payload, task_id)
             if response_data is None:
-                return None, "API 请求失败"
+                return None, "API 请求失败", []
 
             result_image_data = self._extract_gemini_image(response_data, task_id)
             if result_image_data:
-                return result_image_data, None
+                sources = self._extract_grounding_sources(response_data, task_id)
+                return result_image_data, None, sources
 
-            return None, "响应中未找到图片数据"
+            return None, "响应中未找到图片数据", []
 
         except asyncio.TimeoutError:
-            return None, "生成超时"
+            return None, "生成超时", []
         except Exception as e:
             logger.error(f"[Gemini Image] {prefix}Gemini 生成失败: {e}")
-            return None, f"生成失败: {str(e)}"
+            return None, f"生成失败: {str(e)}", []
 
     def _build_gemini_payload(
         self,
@@ -694,6 +752,7 @@ class GeminiImageGenerator:
         aspect_ratio: str | None,
         image_size: str | None,
         thinking_level: str | None = None,
+        search_types: tuple[str, ...] = (),
     ) -> dict:
         generation_config = {"responseModalities": ["IMAGE"]}
         image_config = {}
@@ -744,6 +803,16 @@ class GeminiImageGenerator:
             "generationConfig": generation_config,
             "safetySettings": safety_settings,
         }
+
+        if search_types:
+            # 只开网页搜索时不传 searchTypes，兼容只支持网页搜索的模型
+            google_search = {}
+            if search_types != ("web",):
+                google_search["searchTypes"] = {
+                    SEARCH_TYPE_FIELDS[t]: {} for t in search_types
+                }
+            payload["tools"] = [{"google_search": google_search}]
+
         self._log_payload(payload, "Gemini")
         return payload
 
@@ -814,3 +883,48 @@ class GeminiImageGenerator:
         except Exception as e:
             logger.error(f"[Gemini Image] 解析响应失败: {e}")
             return None
+
+    def _extract_grounding_sources(
+        self, response: dict, task_id: str | None = None
+    ) -> list[tuple[str, str]]:
+        """提取联网搜索的来源网页 [(标题, 链接)]，图片搜索要求向用户展示来源网页"""
+        prefix = f"[{task_id}] " if task_id else ""
+        try:
+            candidates = response.get("candidates") or []
+            if not candidates:
+                return []
+
+            metadata = (
+                candidates[0].get("groundingMetadata")
+                or candidates[0].get("grounding_metadata")
+                or {}
+            )
+            queries = (metadata.get("webSearchQueries") or []) + (
+                metadata.get("imageSearchQueries") or []
+            )
+            if queries:
+                logger.info(f"[Gemini Image] {prefix}联网搜索关键词: {queries}")
+
+            chunks = (
+                metadata.get("groundingChunks")
+                or metadata.get("grounding_chunks")
+                or []
+            )
+            sources = []
+            seen_uris = set()
+            for chunk in chunks:
+                web = chunk.get("web") or {}
+                image = chunk.get("image") or {}
+                # 图片来源要展示其所在网页，而不是图片文件本身
+                uri = (
+                    web.get("uri") or image.get("sourceUri") or image.get("source_uri")
+                )
+                title = web.get("title") or image.get("title") or image.get("domain")
+                if uri and uri not in seen_uris:
+                    seen_uris.add(uri)
+                    sources.append((title or "", uri))
+            return sources
+
+        except Exception as e:
+            logger.error(f"[Gemini Image] {prefix}解析联网搜索来源失败: {e}")
+            return []

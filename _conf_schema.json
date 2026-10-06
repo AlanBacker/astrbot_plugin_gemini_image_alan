@@ -138,6 +138,18 @@
           "high"
         ]
       },
+      "search_grounding": {
+        "description": "联网搜索",
+        "hint": "开启后模型可借助 Google 搜索,按实时信息或真实物品的样子生图(如天气、新闻、地标、商品)。网页搜索支持 Gemini 3 系列和 Nano Banana 2.1;图片搜索仅支持 Nano Banana 2.1 和 Gemini 3.1 Flash Image,且不能用于搜索人物。用到搜索时会在图片后附上参考来源链接(图片搜索要求必须展示)。仅 gemini 接口支持,搜索可能额外计费",
+        "type": "string",
+        "default": "关闭",
+        "options": [
+          "关闭",
+          "网页搜索",
+          "图片搜索",
+          "网页+图片搜索"
+        ]
+      },
       "max_concurrent_generations": {
         "description": "最大并发生成数",
         "hint": "同时生成图片的最大数量,防止资源耗尽",

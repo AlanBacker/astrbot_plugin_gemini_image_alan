@@ -241,6 +241,13 @@ class GeminiImagePlugin(Star):
         "gemini-nano-banana-2.1",
     ]
 
+    # 联网搜索选项对应的搜索类型
+    SEARCH_GROUNDING_MODES = {
+        "网页搜索": ("web",),
+        "图片搜索": ("image",),
+        "网页+图片搜索": ("web", "image"),
+    }
+
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.context = context
@@ -265,6 +272,7 @@ class GeminiImagePlugin(Star):
             max_retry_attempts=self.max_retry_attempts,
             proxy=self.proxy,
             safety_settings=self.safety_settings,
+            search_types=self.SEARCH_GROUNDING_MODES.get(self.search_grounding, ()),
         )
 
         self.background_tasks: set[asyncio.Task] = set()
@@ -315,6 +323,7 @@ class GeminiImagePlugin(Star):
         self.default_aspect_ratio = generate_config.get("default_aspect_ratio", "1:1")
         self.default_resolution = generate_config.get("default_resolution", "1K")
         self.thinking_level = generate_config.get("thinking_level", "默认")
+        self.search_grounding = generate_config.get("search_grounding", "关闭")
         self.max_retry_attempts = generate_config.get("max_retry_attempts", 3)
         self.safety_settings = generate_config.get("safety_settings", "BLOCK_NONE")
         self.max_image_size_mb = generate_config.get("max_image_size_mb", 10)
@@ -967,6 +976,14 @@ class GeminiImagePlugin(Star):
             logger.error(f"[Gemini Image] 获取图片失败 (URL/Path: {url}): {e}")
         return None
 
+    @staticmethod
+    def _format_grounding_sources(sources: list[tuple[str, str]]) -> str:
+        """把联网搜索来源整理成带链接的文字"""
+        lines = ["🔎 参考来源:"]
+        for idx, (title, uri) in enumerate(sources, 1):
+            lines.append(f"{idx}. {title} {uri}" if title else f"{idx}. {uri}")
+        return "\n".join(lines)
+
     async def _generate_and_send_image_async(
         self,
         prompt: str,
@@ -998,7 +1015,7 @@ class GeminiImagePlugin(Star):
         rate_limit_recorded = False
         async with self._generation_semaphore:
             try:
-                results, error = await self.generator.generate_image(
+                results, error, sources = await self.generator.generate_image(
                     prompt=prompt,
                     images_data=images_data,
                     aspect_ratio=final_ar,
@@ -1040,6 +1057,10 @@ class GeminiImagePlugin(Star):
                         MessageChain().message("❌ 生成的图片保存失败"),
                     )
                     return
+
+                # 使用了联网搜索时，随图片附上来源网页链接
+                if sources:
+                    chain.message(self._format_grounding_sources(sources))
 
                 await self.context.send_message(unified_msg_origin, chain)
                 if rate_limit_subject_id and rate_limit_request_id:
