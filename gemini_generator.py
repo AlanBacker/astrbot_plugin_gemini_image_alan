@@ -15,6 +15,22 @@ from PIL import Image
 
 from astrbot.api import logger
 
+# 支持调节思考等级的模型（按名称片段匹配），值为该模型可用的等级
+THINKING_LEVEL_MODELS = {
+    "nano-banana-2.1": ("minimal", "medium", "high"),
+    "gemini-3.1-flash-lite-image": ("minimal", "high"),
+    "gemini-3.1-flash-image": ("minimal", "high"),
+}
+
+
+def get_supported_thinking_levels(model: str) -> tuple[str, ...]:
+    """返回模型可用的思考等级，不支持调节时返回空元组"""
+    model = model.lower()
+    for name, levels in THINKING_LEVEL_MODELS.items():
+        if name in model:
+            return levels
+    return ()
+
 
 class GeminiImageGenerator:
     """Gemini 图像生成器"""
@@ -147,15 +163,17 @@ class GeminiImageGenerator:
         aspect_ratio: str | None = "1:1",
         image_size: str | None = None,
         task_id: str | None = None,
+        thinking_level: str | None = None,
     ) -> tuple[list[bytes] | None, str | None]:
         """生成图片"""
         logger.debug(
-            f"[Gemini Image] generate_image params - Model: {self.model}, Aspect: {aspect_ratio}, Size: {image_size}, TaskID: {task_id}"
+            f"[Gemini Image] generate_image params - Model: {self.model}, Aspect: {aspect_ratio}, Size: {image_size}, Thinking: {thinking_level}, TaskID: {task_id}"
         )
         if not self.api_keys:
             return None, "未配置 API Key"
 
         prefix = f"[{task_id}] " if task_id else ""
+        thinking_level = self._resolve_thinking_level(thinking_level, prefix)
 
         # 转换所有图片格式
         converted_images = []
@@ -175,7 +193,12 @@ class GeminiImageGenerator:
                 )
 
             result = await self._try_generate_with_current_key(
-                prompt, converted_images, aspect_ratio, image_size, task_id
+                prompt,
+                converted_images,
+                aspect_ratio,
+                image_size,
+                task_id,
+                thinking_level,
             )
 
             if result[0] is not None:
@@ -195,6 +218,28 @@ class GeminiImageGenerator:
 
         return None, f"重试失败: {last_error}"
 
+    def _resolve_thinking_level(
+        self, thinking_level: str | None, prefix: str = ""
+    ) -> str | None:
+        """校验思考等级，当前模型不支持时不传该参数，避免请求被拒绝"""
+        if not thinking_level:
+            return None
+
+        level = str(thinking_level).strip().lower()
+        supported = get_supported_thinking_levels(self.model)
+        if level in supported:
+            return level
+
+        if supported:
+            logger.warning(
+                f"[Gemini Image] {prefix}模型 {self.model} 不支持思考等级 {level}（可用: {'/'.join(supported)}），将使用模型默认等级"
+            )
+        else:
+            logger.warning(
+                f"[Gemini Image] {prefix}模型 {self.model} 不支持调节思考等级，已忽略该设置"
+            )
+        return None
+
     async def _try_generate_with_current_key(
         self,
         prompt: str,
@@ -202,19 +247,21 @@ class GeminiImageGenerator:
         aspect_ratio: str | None,
         image_size: str | None,
         task_id: str | None = None,
+        thinking_level: str | None = None,
     ) -> tuple[list[bytes] | None, str | None]:
         """使用当前 API Key 尝试生成图片"""
         if self.api_type == "gemini":
             return await self._generate_gemini(
-                prompt, images_data, aspect_ratio, image_size, task_id
+                prompt, images_data, aspect_ratio, image_size, task_id, thinking_level
             )
         elif self.api_type == "zai":
+            # Zai 格式没有思考等级参数
             return await self._generate_zai(
                 prompt, images_data, aspect_ratio, image_size, task_id
             )
         else:
             return await self._generate_openai(
-                prompt, images_data, aspect_ratio, image_size, task_id
+                prompt, images_data, aspect_ratio, image_size, task_id, thinking_level
             )
 
     def _log_payload(self, payload: dict, provider: str):
@@ -247,6 +294,7 @@ class GeminiImageGenerator:
         aspect_ratio: str | None,
         image_size: str | None,
         task_id: str | None = None,
+        thinking_level: str | None = None,
     ) -> tuple[list[bytes] | None, str | None]:
         """使用 OpenAI 兼容格式 API 生成图片 (Chat Completions)"""
         prefix = f"[{task_id}] " if task_id else ""
@@ -254,7 +302,7 @@ class GeminiImageGenerator:
         try:
             # 统一使用 Chat Completions 接口
             payload = self._build_openai_chat_payload(
-                prompt, images_data, aspect_ratio, image_size
+                prompt, images_data, aspect_ratio, image_size, thinking_level
             )
             endpoint_type = "v1/chat/completions"
 
@@ -290,6 +338,7 @@ class GeminiImageGenerator:
         images_data: list[tuple[bytes, str]] | None,
         aspect_ratio: str | None,
         image_size: str | None,
+        thinking_level: str | None = None,
     ) -> dict:
         """构建 OpenAI Chat Completions 请求负载"""
 
@@ -310,6 +359,10 @@ class GeminiImageGenerator:
             "modalities": ["image", "text"],
             "stream": False,
         }
+
+        # OpenAI 兼容层会把 reasoning_effort 映射为 Gemini 的思考等级
+        if thinking_level:
+            payload["reasoning_effort"] = thinking_level
 
         # image_config
         image_config = {}
@@ -607,13 +660,14 @@ class GeminiImageGenerator:
         aspect_ratio: str | None,
         image_size: str | None,
         task_id: str | None = None,
+        thinking_level: str | None = None,
     ) -> tuple[list[bytes] | None, str | None]:
         """使用 Gemini 格式 API 生成图片"""
         prefix = f"[{task_id}] " if task_id else ""
 
         try:
             payload = self._build_gemini_payload(
-                prompt, images_data, aspect_ratio, image_size
+                prompt, images_data, aspect_ratio, image_size, thinking_level
             )
 
             session = self._get_session()
@@ -639,6 +693,7 @@ class GeminiImageGenerator:
         images_data: list[tuple[bytes, str]],
         aspect_ratio: str | None,
         image_size: str | None,
+        thinking_level: str | None = None,
     ) -> dict:
         generation_config = {"responseModalities": ["IMAGE"]}
         image_config = {}
@@ -646,12 +701,16 @@ class GeminiImageGenerator:
         if aspect_ratio and not images_data:
             image_config["aspectRatio"] = aspect_ratio
 
-        # imageSize 仅 gemini-3-pro-image-preview 支持
-        if image_size and "gemini-3" in self.model.lower():
+        # imageSize 仅 Gemini 3 系列和 Nano Banana 2 系列支持
+        model_name = self.model.lower()
+        if image_size and ("gemini-3" in model_name or "nano-banana-2" in model_name):
             image_config["imageSize"] = image_size
 
         if image_config:
             generation_config["imageConfig"] = image_config
+
+        if thinking_level:
+            generation_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
 
         safety_settings = []
         if self.safety_settings:
@@ -741,6 +800,9 @@ class GeminiImageGenerator:
             parts = candidates[0].get("content", {}).get("parts", [])
             images = []
             for part in parts:
+                # 跳过思考过程中的草稿图，最终图片会以普通 part 返回
+                if part.get("thought"):
+                    continue
                 inline_data = part.get("inline_data") or part.get("inlineData")
                 if inline_data:
                     data = inline_data.get("data")

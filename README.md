@@ -46,7 +46,8 @@
 - ✅ **图生图**：基于参考图片（支持多张）生成新图片。
 - ✅ **智能参考图**：自动识别消息、引用消息中的图片，以及通过@用户获取其头像作为参考图。
 - ✅ **LLM 集成**：可在对话中由 LLM 自动调用图像生成功能（支持图生图）。
-- ✅ **模型管理**：通过指令动态查看和切换可用的 Gemini 模型。
+- ✅ **模型管理**：通过指令动态查看和切换可用的 Gemini 模型，支持 Nano Banana 2.1（`gemini-nano-banana-2.1`）。
+- ✅ **思考等级**：可为 Nano Banana 2.1 / Gemini 3.1 Flash Image 设置思考等级（minimal / medium / high），在出图质量与速度、费用之间取舍；JSON 预设也可单独指定。
 - ✅ **强大预设**：支持快速调用预定义模板，并可通过指令动态管理（增/删）。
 - ✅ **多 API Key 轮询**：支持配置多个 API Key，失败或限流时自动切换，提高可用性。
 - ✅ **失败重试**：在生成失败时自动进行重试。
@@ -74,6 +75,7 @@
 | `timeout`                    | number  | `300`                                         | 生图请求的超时时间（秒）。                                        |
 | `default_aspect_ratio`       | string  | `"1:1"`                                       | 使用 `/生图` 命令时的默认图片宽高比。                             |
 | `default_resolution`         | string  | `"1K"`                                        | 使用 `/生图` 命令时的默认分辨率 (仅部分模型支持)。                |
+| `thinking_level`             | string  | `"默认"`                                      | 思考等级 `minimal`/`medium`/`high`，仅支持的模型生效，见下方说明。 |
 | `max_concurrent_generations` | number  | `3`                                           | 允许同时进行的最大图片生成任务数。                                |
 | `max_requests_per_minute`    | number  | `3`                                           | 当前群或私聊用户每分钟的最大请求次数。                            |
 | `max_requests_per_hour`      | number  | `30`                                          | 当前群或私聊用户滚动一小时的最大成功生图次数。                    |
@@ -81,6 +83,18 @@
 | `max_image_size_mb`          | number  | `10`                                          | 允许作为参考图上传的最大图片大小（MB）。                          |
 | `max_retry_attempts`         | number  | `3`                                           | API 请求失败时的最大自动重试次数。                                |
 | `presets`                    | list    | `[...]`                                       | 预设提示词列表，格式为 `"名称:提示词"`。                          |
+
+### 思考等级 (thinking_level)
+
+| 模型                     | 可用等级                  | 模型默认  |
+| ------------------------ | ------------------------- | --------- |
+| `gemini-nano-banana-2.1` | `minimal`、`medium`、`high` | `medium`  |
+| `gemini-3.1-flash-image` | `minimal`、`high`          | `minimal` |
+
+- `默认`：不传思考等级，由模型使用自身默认值。
+- 等级越高，复杂构图和文字渲染越准确，但出图更慢，思考 token 也会计费。
+- 当前模型不支持所选等级时，插件会忽略该设置并在日志中提示，不会导致请求失败。
+- `openai` 接口以 `reasoning_effort` 字段传递，`zai` 接口不支持。
 
 ### 权限与拦截配置 (permission_config)
 
@@ -137,10 +151,11 @@
 
 基础格式> 预设名:提示词
 
-Json格式(支持指定比例和分辨率)> 预设名:{"prompt": "提示词", "aspect_ratio": "比例", "resolution": "分辨率"}
+Json格式(支持指定比例、分辨率和思考等级)> 预设名:{"prompt": "提示词", "aspect_ratio": "比例", "resolution": "分辨率", "thinking_level": "思考等级"}
 
 > 支持的比例:["1:1","2:3","3:2","3:4","4:3", "4:5","5:4","9:16","16:9","21:9"]  
-> 支持的分辨率(仅Gemini 3 Pro Image Preview):["1K", "2K", "4K"]
+> 支持的分辨率(仅 Gemini 3 系列和 Nano Banana 2.1):["1K", "2K", "4K"]  
+> 支持的思考等级(仅 Nano Banana 2.1 和 Gemini 3.1 Flash Image):["minimal", "medium", "high"]
 
 #### LLM 自动调用
 ```

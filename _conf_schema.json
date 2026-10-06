@@ -61,6 +61,8 @@
           "gemini-2.5-flash-image",
           "gemini-2.5-flash-image-preview",
           "gemini-3-pro-image-preview",
+          "gemini-3.1-flash-image",
+          "gemini-nano-banana-2.1",
           "自定义模型"
         ]
       },
@@ -115,13 +117,25 @@
       },
       "default_resolution": {
         "description": "默认分辨率",
-        "hint": "使用命令生图时默认使用的图片分辨率,仅 Gemini 3 Pro 模型支持",
+        "hint": "使用命令生图时默认使用的图片分辨率,仅 Gemini 3 系列和 Nano Banana 2.1 模型支持",
         "type": "string",
         "default": "2K",
         "options": [
           "1K",
           "2K",
           "4K"
+        ]
+      },
+      "thinking_level": {
+        "description": "思考等级",
+        "hint": "控制生图前的思考深度,等级越高构图和文字越准确,但耗时和费用越高(思考 token 计费)。Nano Banana 2.1 支持 minimal/medium/high(默认 medium);Gemini 3.1 Flash Image 支持 minimal/high(默认 minimal);其他模型会忽略此项。'默认' 表示使用模型自身的默认等级。zai 接口不支持",
+        "type": "string",
+        "default": "默认",
+        "options": [
+          "默认",
+          "minimal",
+          "medium",
+          "high"
         ]
       },
       "max_concurrent_generations": {

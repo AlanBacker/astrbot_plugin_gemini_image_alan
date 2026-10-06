@@ -68,7 +68,7 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
                 },
                 "resolution": {
                     "type": "string",
-                    "description": "图片分辨率，仅 gemini-3-pro-image-preview(nano banana pro) 模型支持",
+                    "description": "图片分辨率，仅 Gemini 3 系列(nano banana pro)和 nano banana 2.1 模型支持",
                     "enum": ["1K", "2K", "4K"],
                 },
                 "avatar_references": {
@@ -191,9 +191,10 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
         # 记录任务摘要
         res = kwargs.get("resolution", plugin.default_resolution)
         ar = kwargs.get("aspect_ratio", plugin.default_aspect_ratio)
+        thinking_level = plugin.thinking_level
         img_count = len(images_data) if images_data else 0
         logger.info(
-            f"[Gemini Image] 任务摘要 [{task_id}] - 提示词: {prompt} | 预设: 无 | 参考图: {img_count}张 | 分辨率: {res} | 比例: {ar}"
+            f"[Gemini Image] 任务摘要 [{task_id}] - 提示词: {prompt} | 预设: 无 | 参考图: {img_count}张 | 分辨率: {res} | 比例: {ar} | 思考等级: {thinking_level}"
         )
 
         try:
@@ -204,6 +205,7 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
                     unified_msg_origin=event.unified_msg_origin,
                     aspect_ratio=ar,
                     resolution=res,
+                    thinking_level=thinking_level,
                     task_id=task_id,
                     rate_limit_subject_id=(
                         rate_limit_subject_id if rate_limit_enabled else None
@@ -235,6 +237,8 @@ class GeminiImagePlugin(Star):
         "gemini-2.5-flash-image",
         "gemini-2.5-flash-image-preview",
         "gemini-3-pro-image-preview",
+        "gemini-3.1-flash-image",
+        "gemini-nano-banana-2.1",
     ]
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -310,6 +314,7 @@ class GeminiImagePlugin(Star):
         self.timeout = generate_config.get("timeout", 300)
         self.default_aspect_ratio = generate_config.get("default_aspect_ratio", "1:1")
         self.default_resolution = generate_config.get("default_resolution", "1K")
+        self.thinking_level = generate_config.get("thinking_level", "默认")
         self.max_retry_attempts = generate_config.get("max_retry_attempts", 3)
         self.safety_settings = generate_config.get("safety_settings", "BLOCK_NONE")
         self.max_image_size_mb = generate_config.get("max_image_size_mb", 10)
@@ -578,6 +583,7 @@ class GeminiImagePlugin(Star):
         # 默认参数
         aspect_ratio = self.default_aspect_ratio
         resolution = self.default_resolution
+        thinking_level = self.thinking_level
 
         # 检查是否使用了预设
         matched_preset = None
@@ -613,6 +619,9 @@ class GeminiImagePlugin(Star):
                         prompt = preset_data.get("prompt", "")
                         aspect_ratio = preset_data.get("aspect_ratio", aspect_ratio)
                         resolution = preset_data.get("resolution", resolution)
+                        thinking_level = preset_data.get(
+                            "thinking_level", thinking_level
+                        )
                     else:
                         prompt = preset_content
                 else:
@@ -649,7 +658,7 @@ class GeminiImagePlugin(Star):
             msg += f"[预设: {matched_preset}]"
 
         logger.debug(
-            f"[Gemini Image] 参数解析 - 消息: {msg}, 比例: {aspect_ratio}, 分辨率: {resolution}"
+            f"[Gemini Image] 参数解析 - 消息: {msg}, 比例: {aspect_ratio}, 分辨率: {resolution}, 思考等级: {thinking_level}"
         )
 
         yield event.plain_result(msg)
@@ -658,7 +667,7 @@ class GeminiImagePlugin(Star):
         preset_name = matched_preset if matched_preset else "无"
         img_count = len(images_data) if images_data else 0
         logger.info(
-            f"[Gemini Image] 任务摘要 [{task_id}] - 提示词: {prompt} | 预设: {preset_name} | 参考图: {img_count}张 | 分辨率: {resolution} | 比例: {aspect_ratio}"
+            f"[Gemini Image] 任务摘要 [{task_id}] - 提示词: {prompt} | 预设: {preset_name} | 参考图: {img_count}张 | 分辨率: {resolution} | 比例: {aspect_ratio} | 思考等级: {thinking_level}"
         )
 
         # 创建后台任务
@@ -670,6 +679,7 @@ class GeminiImagePlugin(Star):
                     unified_msg_origin=event.unified_msg_origin,
                     aspect_ratio=aspect_ratio,
                     resolution=resolution,
+                    thinking_level=thinking_level,
                     task_id=task_id,
                     rate_limit_subject_id=(
                         rate_limit_subject_id if rate_limit_enabled else None
@@ -964,6 +974,7 @@ class GeminiImagePlugin(Star):
         images_data: list[tuple[bytes, str]] | None = None,
         aspect_ratio: str = "1:1",
         resolution: str = "1K",
+        thinking_level: str | None = None,
         task_id: str | None = None,
         rate_limit_subject_id: str | None = None,
         rate_limit_request_id: str | None = None,
@@ -979,6 +990,11 @@ class GeminiImagePlugin(Star):
         if aspect_ratio == "自动":
             final_ar = None
 
+        # "默认" 表示不传思考等级，由模型使用自身默认值
+        final_thinking_level = thinking_level
+        if thinking_level == "默认":
+            final_thinking_level = None
+
         rate_limit_recorded = False
         async with self._generation_semaphore:
             try:
@@ -988,6 +1004,7 @@ class GeminiImagePlugin(Star):
                     aspect_ratio=final_ar,
                     image_size=resolution,
                     task_id=task_id,
+                    thinking_level=final_thinking_level,
                 )
 
                 if error:
