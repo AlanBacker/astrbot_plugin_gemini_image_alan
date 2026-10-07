@@ -1,0 +1,8 @@
+{
+  "pages": {
+    "sessions": {
+      "title": "Sessions",
+      "description": "View the group and private chats that used image generation, reset or edit their quota, and manage the permission lists."
+    }
+  }
+}

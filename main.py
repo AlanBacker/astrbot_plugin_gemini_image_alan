@@ -31,6 +31,7 @@ from .config_migration import migrate_legacy_config
 from .data_migration import migrate_legacy_data_dir
 from .gemini_generator import GeminiImageGenerator
 from .rate_limit import RateLimitStore
+from .session_registry import SessionRegistry, describe_subject
 
 PLUGIN_NAME = "astrbot_plugin_gemini_image_alan"
 LEGACY_PLUGIN_NAME = "astrbot_plugin_gemini_image"
@@ -182,6 +183,7 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
         task_id = hashlib.md5(
             f"{time.time()}{request_user_id}{event.unified_msg_origin}".encode()
         ).hexdigest()[:8]
+        plugin._register_session(event, rate_limit_subject_id, request_user_id)
         is_allowed, rate_msg, rate_limit_enabled = await plugin._reserve_rate_limit(
             rate_limit_subject_id, task_id
         )
@@ -207,6 +209,7 @@ class GeminiImageGenerationTool(FunctionTool[AstrAgentContext]):
                     resolution=res,
                     thinking_level=thinking_level,
                     task_id=task_id,
+                    session_subject_id=rate_limit_subject_id,
                     rate_limit_subject_id=(
                         rate_limit_subject_id if rate_limit_enabled else None
                     ),
@@ -285,11 +288,14 @@ class GeminiImagePlugin(Star):
 
         self.data_dir = current_data_dir
         self.rate_limit_store = RateLimitStore(self.data_dir)
+        self.session_registry = SessionRegistry(self.data_dir)
 
         # 注册工具到 LLM
         if self.enable_llm_tool:
             self.context.add_llm_tools(GeminiImageGenerationTool(plugin=self))
             logger.info("[Gemini Image] 已注册图像生成工具（支持头像引用）")
+
+        self._register_web_apis()
 
         logger.info(f"[Gemini Image] 插件已加载，使用模型: {self.model}")
 
@@ -561,6 +567,30 @@ class GeminiImagePlugin(Star):
                 "[Gemini Image] 图片已发送，但限额记录写入失败；已自动停止后续生图"
             )
 
+    def _register_session(
+        self, event: AstrMessageEvent, subject_id: str, user_id: str
+    ) -> None:
+        """记录发起生图的会话，供 WebUI 会话管理页展示；失败不影响生图。"""
+        try:
+            kind, _ = describe_subject(subject_id)
+            group = getattr(getattr(event, "message_obj", None), "group", None)
+            user_name = event.get_sender_name()
+            self.session_registry.touch(
+                subject_id,
+                name=getattr(group, "group_name", "") if kind == "group" else user_name,
+                platform=event.get_platform_name(),
+                user_id=user_id,
+                user_name=user_name,
+            )
+        except Exception as e:
+            logger.warning(f"[Gemini Image] 会话记录写入失败: {e}")
+
+    def _record_session_success(self, subject_id: str) -> None:
+        try:
+            self.session_registry.record_success(subject_id)
+        except Exception as e:
+            logger.warning(f"[Gemini Image] 会话累计次数写入失败: {e}")
+
     @filter.command("生图")
     async def generate_image_command(self, event: AstrMessageEvent):
         """生成图片指令"""
@@ -655,6 +685,7 @@ class GeminiImagePlugin(Star):
         # 生成任务 ID，并在真正创建生图任务前预留频率额度
         task_id = hashlib.md5(f"{time.time()}{user_id}".encode()).hexdigest()[:8]
         rate_limit_subject_id = self._get_rate_limit_subject(user_id, group_id)
+        self._register_session(event, rate_limit_subject_id, user_id)
         is_allowed, rate_msg, rate_limit_enabled = await self._reserve_rate_limit(
             rate_limit_subject_id, task_id
         )
@@ -693,6 +724,7 @@ class GeminiImagePlugin(Star):
                     resolution=resolution,
                     thinking_level=thinking_level,
                     task_id=task_id,
+                    session_subject_id=rate_limit_subject_id,
                     rate_limit_subject_id=(
                         rate_limit_subject_id if rate_limit_enabled else None
                     ),
@@ -996,6 +1028,7 @@ class GeminiImagePlugin(Star):
         resolution: str = "1K",
         thinking_level: str | None = None,
         task_id: str | None = None,
+        session_subject_id: str | None = None,
         rate_limit_subject_id: str | None = None,
         rate_limit_request_id: str | None = None,
     ):
@@ -1066,6 +1099,8 @@ class GeminiImagePlugin(Star):
                     chain.message(self._format_grounding_sources(sources))
 
                 await self.context.send_message(unified_msg_origin, chain)
+                if session_subject_id:
+                    self._record_session_success(session_subject_id)
                 if rate_limit_subject_id and rate_limit_request_id:
                     await self._finish_rate_limit_request(
                         rate_limit_subject_id,
@@ -1092,6 +1127,213 @@ class GeminiImagePlugin(Star):
                         successful=False,
                     )
 
+    # ==================== WebUI 会话管理页 ====================
+    # 页面位于 pages/sessions，由 AstrBot WebUI（v4.24.1+）的插件页面加载；
+    # 接口挂在 WebUI 的登录鉴权之后，只有登录 WebUI 的管理员能调用。
+
+    def _register_web_apis(self) -> None:
+        if not hasattr(self.context, "register_web_api"):
+            return
+        routes = (
+            ("sessions", self.panel_list_sessions, ["GET"], "列出会话与额度"),
+            ("sessions/usage", self.panel_set_usage, ["POST"], "修改会话已用次数"),
+            ("sessions/reset", self.panel_reset_usage, ["POST"], "重置会话额度"),
+            ("sessions/reset_all", self.panel_reset_all, ["POST"], "重置全部额度"),
+            ("sessions/remark", self.panel_set_remark, ["POST"], "修改会话备注"),
+            (
+                "sessions/permission",
+                self.panel_set_permission,
+                ["POST"],
+                "修改会话权限名单",
+            ),
+        )
+        for endpoint, handler, methods, desc in routes:
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/{endpoint}", handler, methods, f"[Gemini生图] {desc}"
+            )
+
+    @staticmethod
+    def _panel_ok(data: Any = None) -> dict[str, Any]:
+        return {"status": "ok", "message": "", "data": data}
+
+    @staticmethod
+    def _panel_error(message: str) -> dict[str, Any]:
+        # 统一返回 200，WebUI 会把 status=error 的 message 原样交给页面显示
+        return {"status": "error", "message": message, "data": None}
+
+    @staticmethod
+    async def _read_panel_payload() -> dict[str, Any]:
+        try:
+            from astrbot.api.web import request
+        except ImportError:  # AstrBot < v4.26 的插件接口运行在 Quart 上
+            from quart import request
+
+            payload = await request.get_json(silent=True)
+        else:
+            payload = await request.json(default={})
+        return payload if isinstance(payload, dict) else {}
+
+    async def _read_panel_subject(self) -> tuple[dict[str, Any], str]:
+        payload = await self._read_panel_payload()
+        return payload, SessionRegistry.normalize_subject(payload.get("subject"))
+
+    async def panel_list_sessions(self):
+        usage, error = await self.rate_limit_store.overview()
+        if usage is None:
+            return self._panel_error(error)
+
+        warning = ""
+        try:
+            records = self.session_registry.list()
+        except Exception as e:
+            records = {}
+            warning = f"会话记录读取失败（{self.session_registry.path}）: {e}"
+
+        perm_conf = self.config.get("permission_config", {})
+        mode = str(perm_conf.get("mode", "disable")).strip().lower()
+        listed = {
+            "private": {str(u).strip() for u in perm_conf.get("users", [])} - {""},
+            "group": {str(g).strip() for g in perm_conf.get("groups", [])} - {""},
+        }
+
+        # 用过插件的会话、仍有额度记录的会话、权限名单里的会话都列出来
+        subjects = set(records) | set(usage)
+        subjects |= listed["private"]
+        subjects |= {f"group:{group_id}" for group_id in listed["group"]}
+
+        empty_usage = {
+            "minute": 0,
+            "hour": 0,
+            "day": 0,
+            "pending": 0,
+            "next_release": None,
+        }
+        sessions = []
+        for subject in subjects:
+            kind, target_id = describe_subject(subject)
+            record = records.get(subject, {})
+            is_listed = target_id in listed[kind]
+            if mode == "blacklist":
+                allowed = not is_listed
+            elif mode == "whitelist":
+                allowed = is_listed
+            else:
+                allowed = True
+            sessions.append(
+                {
+                    "subject": subject,
+                    "kind": kind,
+                    "target_id": target_id,
+                    "name": record.get("name", ""),
+                    "remark": record.get("remark", ""),
+                    "platform": record.get("platform", ""),
+                    "last_user_id": record.get("last_user_id", ""),
+                    "last_user_name": record.get("last_user_name", ""),
+                    "total_success": record.get("total_success", 0),
+                    "first_seen": record.get("first_seen"),
+                    "last_seen": record.get("last_seen"),
+                    "last_success": record.get("last_success"),
+                    "usage": usage.get(subject, empty_usage),
+                    "listed": is_listed,
+                    "allowed": allowed,
+                }
+            )
+        sessions.sort(key=lambda item: item["last_seen"] or 0, reverse=True)
+
+        enabled, minute_limit, hour_limit, day_limit = self._get_rate_limit_settings()
+        return self._panel_ok(
+            {
+                "now": time.time(),
+                "limits": {
+                    "enabled": enabled,
+                    "minute": minute_limit,
+                    "hour": hour_limit,
+                    "day": day_limit,
+                },
+                "permission_mode": mode,
+                "sessions": sessions,
+                "warning": warning,
+            }
+        )
+
+    async def panel_set_usage(self):
+        try:
+            payload, subject = await self._read_panel_subject()
+        except ValueError as e:
+            return self._panel_error(str(e))
+        used = payload.get("used")
+        ok, error = await self.rate_limit_store.set_used(subject, used)
+        if not ok:
+            return self._panel_error(error)
+        logger.info(
+            f"[Gemini Image] WebUI 已把会话 {subject} 的24小时已用次数改为 {used}"
+        )
+        return self._panel_ok()
+
+    async def panel_reset_usage(self):
+        try:
+            _, subject = await self._read_panel_subject()
+        except ValueError as e:
+            return self._panel_error(str(e))
+        ok, error = await self.rate_limit_store.reset(subject)
+        if not ok:
+            return self._panel_error(error)
+        logger.info(f"[Gemini Image] WebUI 已重置会话 {subject} 的生图额度")
+        return self._panel_ok()
+
+    async def panel_reset_all(self):
+        ok, error = await self.rate_limit_store.reset_all()
+        if not ok:
+            return self._panel_error(error)
+        logger.info("[Gemini Image] WebUI 已重置全部会话的生图额度")
+        return self._panel_ok()
+
+    async def panel_set_remark(self):
+        try:
+            payload, subject = await self._read_panel_subject()
+            self.session_registry.set_remark(subject, payload.get("remark", ""))
+        except ValueError as e:
+            return self._panel_error(str(e))
+        except OSError as e:
+            return self._panel_error(f"备注保存失败: {e}")
+        return self._panel_ok()
+
+    async def panel_set_permission(self):
+        """把会话加入或移出权限名单；名单含义由权限模式决定（黑名单或白名单）。"""
+        try:
+            payload, subject = await self._read_panel_subject()
+        except ValueError as e:
+            return self._panel_error(str(e))
+        listed = payload.get("listed")
+        if not isinstance(listed, bool):
+            return self._panel_error("listed 必须是布尔值")
+
+        kind, target_id = describe_subject(subject)
+        key = "groups" if kind == "group" else "users"
+        perm_conf = self.config.get("permission_config")
+        if not isinstance(perm_conf, dict):
+            perm_conf = {}
+            self.config["permission_config"] = perm_conf
+        entries = [
+            entry
+            for entry in perm_conf.get(key, []) or []
+            if str(entry).strip() != target_id
+        ]
+        if listed:
+            entries.append(target_id)
+        perm_conf[key] = entries
+        try:
+            self.config.save_config()
+        except Exception as e:
+            return self._panel_error(f"插件配置保存失败: {e}")
+
+        # 权限检查每次实时读取配置，这里同步一下仅用于日志的缓存
+        self.perm_users = set(perm_conf.get("users", []))
+        self.perm_groups = set(perm_conf.get("groups", []))
+        action = "加入" if listed else "移出"
+        logger.info(f"[Gemini Image] WebUI 已将会话 {subject} {action}权限名单")
+        return self._panel_ok()
+
     async def terminate(self):
         """卸载清理"""
         try:
@@ -1103,6 +1345,15 @@ class GeminiImagePlugin(Star):
             for task in list(self.background_tasks):
                 if not task.done():
                     task.cancel()
+
+            # 3. 移除本实例注册的 WebUI 接口；重载时新实例注册的接口不受影响
+            web_apis = getattr(self.context, "registered_web_apis", None)
+            if isinstance(web_apis, list):
+                web_apis[:] = [
+                    api
+                    for api in web_apis
+                    if getattr(api[1], "__self__", None) is not self
+                ]
 
             logger.info("[Gemini Image] 插件已卸载")
 

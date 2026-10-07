@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>会话管理</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="page-head">
+        <div>
+          <h1>会话管理</h1>
+          <p class="muted">查看使用过生图功能的群聊和私聊，调整额度和权限名单。</p>
+        </div>
+        <div class="head-actions">
+          <button type="button" class="btn" id="refresh">刷新</button>
+          <button type="button" class="btn btn-danger-outline" id="reset-all">
+            重置全部额度
+          </button>
+        </div>
+      </header>
+
+      <section class="stats" id="stats" aria-label="概览"></section>
+      <div id="notices"></div>
+
+      <section class="panel">
+        <div class="toolbar">
+          <input
+            type="search"
+            id="search"
+            class="input search"
+            placeholder="搜索名称、备注或 ID"
+            autocomplete="off"
+          />
+          <div class="segmented" role="radiogroup" aria-label="会话类型" id="kind-filter">
+            <button type="button" data-kind="all" aria-checked="true" role="radio">全部</button>
+            <button type="button" data-kind="group" aria-checked="false" role="radio">群聊</button>
+            <button type="button" data-kind="private" aria-checked="false" role="radio">私聊</button>
+          </div>
+          <select id="sort" class="input select" aria-label="排序">
+            <option value="recent">最近使用</option>
+            <option value="day">24小时用量</option>
+            <option value="total">累计成功</option>
+          </select>
+        </div>
+        <div id="list" class="list" aria-live="polite">
+          <div class="empty">加载中…</div>
+        </div>
+      </section>
+    </main>
+
+    <div class="overlay" id="dialog" hidden>
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+        <h2 id="dialog-title"></h2>
+        <div id="dialog-body"></div>
+        <p class="dialog-error" id="dialog-error" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn" id="dialog-cancel">取消</button>
+          <button type="button" class="btn btn-primary" id="dialog-confirm">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" role="status" hidden></div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

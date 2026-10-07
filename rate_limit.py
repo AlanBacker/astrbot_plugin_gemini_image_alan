@@ -6,7 +6,7 @@ import math
 import os
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,8 @@ class RateLimitStore:
 
     WINDOW_SECONDS = 86400
     PENDING_TTL_SECONDS = WINDOW_SECONDS
+    # 管理面板手动设置已用次数的上限，防止误输入撑大记录文件
+    MAX_MANUAL_COUNT = 10000
 
     def __init__(self, data_dir: Path):
         self.data_dir = Path(data_dir)
@@ -279,3 +281,99 @@ class RateLimitStore:
             except Exception as exc:
                 self._storage_error = str(exc)
                 return None, self._storage_message(self._storage_error)
+
+    async def overview(
+        self, *, now: float | None = None
+    ) -> tuple[dict[str, dict[str, Any]] | None, str]:
+        """返回所有主体的用量，供 WebUI 管理面板展示。"""
+        if self._storage_error:
+            return None, self._storage_message(self._storage_error)
+
+        now = time.time() if now is None else now
+        async with self._async_lock:
+            try:
+                with self._file_lock():
+                    state = self._read_state()
+            except Exception as exc:
+                self._storage_error = str(exc)
+                return None, self._storage_message(self._storage_error)
+
+        self._prune(state, now)
+        result: dict[str, dict[str, Any]] = {}
+        for user_id in set(state["successful"]) | set(state["pending"]):
+            successful = state["successful"].get(user_id, [])
+            result[user_id] = {
+                "minute": sum(now - value < 60 for value in successful),
+                "hour": sum(now - value < 3600 for value in successful),
+                "day": len(successful),
+                "pending": len(state["pending"].get(user_id, {})),
+                # 最早一条记录过期的时间，即下一次自动恢复额度的时间
+                "next_release": (
+                    min(successful) + self.WINDOW_SECONDS if successful else None
+                ),
+            }
+        return result, ""
+
+    async def set_used(
+        self, user_id: str, count: int, *, now: float | None = None
+    ) -> tuple[bool, str]:
+        """把滚动24小时内的成功次数改为 count，尽量不影响每分钟、每小时的统计。
+
+        减少时先撤销最早的记录；增加时补记在一小时前，
+        只计入24小时窗口，约23小时后自动释放。
+        """
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 0 <= count <= self.MAX_MANUAL_COUNT
+        ):
+            return False, f"❌ 次数必须是 0 到 {self.MAX_MANUAL_COUNT} 之间的整数"
+
+        now = time.time() if now is None else now
+        user_id = str(user_id).strip()
+
+        def update(state: dict[str, Any]) -> None:
+            timestamps = sorted(state["successful"].get(user_id, []))
+            if count < len(timestamps):
+                timestamps = timestamps[len(timestamps) - count :]
+            else:
+                timestamps.extend([now - 3600] * (count - len(timestamps)))
+            if timestamps:
+                state["successful"][user_id] = timestamps
+            else:
+                state["successful"].pop(user_id, None)
+
+        return await self._update_state(update, now)
+
+    async def reset(
+        self, user_id: str, *, now: float | None = None
+    ) -> tuple[bool, str]:
+        """清空主体的成功记录；正在执行的任务不受影响。"""
+        return await self.set_used(user_id, 0, now=now)
+
+    async def reset_all(self, *, now: float | None = None) -> tuple[bool, str]:
+        """清空所有主体的成功记录。"""
+
+        def update(state: dict[str, Any]) -> None:
+            state["successful"].clear()
+
+        now = time.time() if now is None else now
+        return await self._update_state(update, now)
+
+    async def _update_state(
+        self, update: Callable[[dict[str, Any]], None], now: float
+    ) -> tuple[bool, str]:
+        if self._storage_error:
+            return False, self._storage_message(self._storage_error)
+
+        async with self._async_lock:
+            try:
+                with self._file_lock():
+                    state = self._read_state()
+                    self._prune(state, now)
+                    update(state)
+                    self._write_state(state)
+                    return True, ""
+            except Exception as exc:
+                self._storage_error = str(exc)
+                return False, self._storage_message(self._storage_error)
