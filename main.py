@@ -233,6 +233,9 @@ class GeminiImagePlugin(Star):
     # 配置验证常量
     DEFAULT_MAX_CONCURRENT_GENERATIONS = 3
     MAX_CONCURRENT_GENERATIONS = 10
+    # 图片发送失败时的总尝试次数和重试间隔（秒，逐次递增）
+    SEND_RETRY_ATTEMPTS = 3
+    SEND_RETRY_DELAY = 3
 
     # 可用模型列表
     AVAILABLE_MODELS = [
@@ -1038,6 +1041,24 @@ class GeminiImagePlugin(Star):
         except Exception as e:
             logger.warning(f"[Gemini Image] 发送旋转重试提示失败: {e}")
 
+    async def _send_image_with_retry(
+        self, unified_msg_origin: str, chain: MessageChain, task_id: str
+    ) -> Exception | None:
+        """发送图片消息，失败时重试（协议端上传图片偶尔会网络超时），返回最后一次的异常"""
+        last_error = None
+        for attempt in range(self.SEND_RETRY_ATTEMPTS):
+            try:
+                await self.context.send_message(unified_msg_origin, chain)
+                return None
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"[Gemini Image] [{task_id}] 图片发送失败 (第 {attempt + 1}/{self.SEND_RETRY_ATTEMPTS} 次): {e}"
+                )
+                if attempt < self.SEND_RETRY_ATTEMPTS - 1:
+                    await asyncio.sleep(self.SEND_RETRY_DELAY * (attempt + 1))
+        return last_error
+
     async def _generate_and_send_image_async(
         self,
         prompt: str,
@@ -1068,8 +1089,9 @@ class GeminiImagePlugin(Star):
             final_thinking_level = None
 
         rate_limit_recorded = False
-        async with self._generation_semaphore:
-            try:
+        try:
+            # 只在生成时占用并发名额，发送图片（可能要重试）不占用
+            async with self._generation_semaphore:
                 results, error, sources = await self.generator.generate_image(
                     prompt=prompt,
                     images_data=images_data,
@@ -1084,72 +1106,83 @@ class GeminiImagePlugin(Star):
                     ),
                 )
 
-                if error:
-                    await self.context.send_message(
-                        unified_msg_origin,
-                        MessageChain().message(f"❌ 生成失败: {error}"),
-                    )
-                    return
-
-                if not results:
-                    return
-
-                logger.info(
-                    f"[Gemini Image] 任务完成 [{task_id}] - 生成了 {len(results)} 张图片"
-                )
-
-                # 构建消息链
-                chain = MessageChain()
-                saved_image_count = 0
-
-                for img_bytes in results:
-                    # 保存临时文件
-                    try:
-                        file_path = save_temp_img(img_bytes)
-                        chain.file_image(file_path)
-                        saved_image_count += 1
-                    except Exception as e:
-                        logger.error(f"保存图片失败: {e}")
-
-                if saved_image_count == 0:
-                    await self.context.send_message(
-                        unified_msg_origin,
-                        MessageChain().message("❌ 生成的图片保存失败"),
-                    )
-                    return
-
-                # 使用了联网搜索时，随图片附上来源网页链接
-                if sources and self.show_grounding_sources:
-                    chain.message(self._format_grounding_sources(sources))
-
-                await self.context.send_message(unified_msg_origin, chain)
-                if session_subject_id:
-                    self._record_session_success(session_subject_id)
-                if rate_limit_subject_id and rate_limit_request_id:
-                    await self._finish_rate_limit_request(
-                        rate_limit_subject_id,
-                        rate_limit_request_id,
-                        successful=True,
-                    )
-                    rate_limit_recorded = True
-
-            except Exception as e:
-                logger.error(f"[Gemini Image] 任务失败: {e}", exc_info=True)
+            if error:
                 await self.context.send_message(
                     unified_msg_origin,
-                    MessageChain().message("❌ 生成过程中发生未知错误"),
+                    MessageChain().message(f"❌ 生成失败: {error}"),
                 )
-            finally:
-                if (
-                    not rate_limit_recorded
-                    and rate_limit_subject_id
-                    and rate_limit_request_id
-                ):
-                    await self._finish_rate_limit_request(
-                        rate_limit_subject_id,
-                        rate_limit_request_id,
-                        successful=False,
-                    )
+                return
+
+            if not results:
+                return
+
+            logger.info(
+                f"[Gemini Image] 任务完成 [{task_id}] - 生成了 {len(results)} 张图片"
+            )
+
+            # 构建消息链
+            chain = MessageChain()
+            saved_image_count = 0
+
+            for img_bytes in results:
+                # 保存临时文件
+                try:
+                    file_path = save_temp_img(img_bytes)
+                    chain.file_image(file_path)
+                    saved_image_count += 1
+                except Exception as e:
+                    logger.error(f"保存图片失败: {e}")
+
+            if saved_image_count == 0:
+                await self.context.send_message(
+                    unified_msg_origin,
+                    MessageChain().message("❌ 生成的图片保存失败"),
+                )
+                return
+
+            # 使用了联网搜索时，随图片附上来源网页链接
+            if sources and self.show_grounding_sources:
+                chain.message(self._format_grounding_sources(sources))
+
+            send_error = await self._send_image_with_retry(
+                unified_msg_origin, chain, task_id
+            )
+            if send_error:
+                await self.context.send_message(
+                    unified_msg_origin,
+                    MessageChain().message(
+                        "❌ 图片已生成，但发送失败（可能是网络问题），请稍后重试"
+                    ),
+                )
+                return
+
+            if session_subject_id:
+                self._record_session_success(session_subject_id)
+            if rate_limit_subject_id and rate_limit_request_id:
+                await self._finish_rate_limit_request(
+                    rate_limit_subject_id,
+                    rate_limit_request_id,
+                    successful=True,
+                )
+                rate_limit_recorded = True
+
+        except Exception as e:
+            logger.error(f"[Gemini Image] 任务失败: {e}", exc_info=True)
+            await self.context.send_message(
+                unified_msg_origin,
+                MessageChain().message("❌ 生成过程中发生未知错误"),
+            )
+        finally:
+            if (
+                not rate_limit_recorded
+                and rate_limit_subject_id
+                and rate_limit_request_id
+            ):
+                await self._finish_rate_limit_request(
+                    rate_limit_subject_id,
+                    rate_limit_request_id,
+                    successful=False,
+                )
 
     # ==================== WebUI 会话管理页 ====================
     # 页面位于 pages/sessions，由 AstrBot WebUI（v4.24.1+）的插件页面加载；
