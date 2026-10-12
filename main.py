@@ -276,6 +276,7 @@ class GeminiImagePlugin(Star):
             proxy=self.proxy,
             safety_settings=self.safety_settings,
             search_types=self.SEARCH_GROUNDING_MODES.get(self.search_grounding, ()),
+            rotate_retry=self.rotate_retry,
         )
 
         self.background_tasks: set[asyncio.Task] = set()
@@ -334,6 +335,9 @@ class GeminiImagePlugin(Star):
             generate_config.get("show_grounding_sources", True), default=True
         )
         self.max_retry_attempts = generate_config.get("max_retry_attempts", 3)
+        self.rotate_retry = self._as_bool(
+            generate_config.get("rotate_retry", True), default=True
+        )
         self.safety_settings = generate_config.get("safety_settings", "BLOCK_NONE")
         self.max_image_size_mb = generate_config.get("max_image_size_mb", 10)
 

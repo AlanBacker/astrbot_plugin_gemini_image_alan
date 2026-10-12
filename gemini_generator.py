@@ -11,7 +11,7 @@ import re
 from io import BytesIO
 
 import aiohttp
-from PIL import Image
+from PIL import Image, ImageOps
 
 from astrbot.api import logger
 
@@ -63,6 +63,7 @@ class GeminiImageGenerator:
         proxy: str | None = None,
         safety_settings: str = "BLOCK_NONE",
         search_types: tuple[str, ...] = (),
+        rotate_retry: bool = True,
     ):
         self.api_keys = api_keys if api_keys else []
         self.current_key_index = 0
@@ -74,6 +75,7 @@ class GeminiImageGenerator:
         self.proxy = proxy
         self.safety_settings = safety_settings
         self.search_types = tuple(search_types)
+        self.rotate_retry = rotate_retry
         self._session: aiohttp.ClientSession | None = None
 
     def _get_current_api_key(self) -> str:
@@ -204,17 +206,76 @@ class GeminiImageGenerator:
                 )
                 converted_images.append((converted_data, converted_mime))
 
-        last_error = "未配置 API Key"
+        result = await self._generate_with_retries(
+            prompt,
+            converted_images,
+            aspect_ratio,
+            image_size,
+            task_id,
+            thinking_level,
+            search_types,
+        )
+        if result[0] is not None:
+            return result
+        last_error = result[1]
+
+        # 常规重试全部失败时，把参考图旋转 180 度再试同样次数，成功后把结果转回来
+        if self.rotate_retry and converted_images:
+            rotated_images = await asyncio.to_thread(
+                self._sync_rotate_images, converted_images, prefix
+            )
+            if rotated_images:
+                logger.info(
+                    f"[Gemini Image] {prefix}常规重试均失败，将参考图旋转180度后再重试 {self.max_retry_attempts} 次"
+                )
+                await self._wait_before_retry(self.max_retry_attempts - 1)
+                result = await self._generate_with_retries(
+                    prompt,
+                    rotated_images,
+                    aspect_ratio,
+                    image_size,
+                    task_id,
+                    thinking_level,
+                    search_types,
+                    rotated=True,
+                )
+                if result[0] is not None:
+                    images = await asyncio.to_thread(
+                        self._sync_rotate_results, result[0], prefix
+                    )
+                    return images, None, result[2]
+                last_error = result[1]
+
+        return None, f"重试失败: {last_error}", []
+
+    async def _generate_with_retries(
+        self,
+        prompt: str,
+        images_data: list[tuple[bytes, str]],
+        aspect_ratio: str | None,
+        image_size: str | None,
+        task_id: str | None,
+        thinking_level: str | None,
+        search_types: tuple[str, ...],
+        rotated: bool = False,
+    ) -> tuple[list[bytes] | None, str | None, list[tuple[str, str]]]:
+        """按最大重试次数尝试生成，全部失败时返回最后一次的错误信息"""
+        prefix = f"[{task_id}] " if task_id else ""
+        last_error = "生成失败"
 
         for attempt in range(self.max_retry_attempts):
-            if attempt > 0:
+            if rotated:
+                logger.info(
+                    f"[Gemini Image] {prefix}参考图旋转180度后重试 (第 {attempt + 1}/{self.max_retry_attempts} 次)"
+                )
+            elif attempt > 0:
                 logger.info(
                     f"[Gemini Image] {prefix}重试生成 (第 {attempt + 1}/{self.max_retry_attempts} 次)"
                 )
 
             result = await self._try_generate_with_current_key(
                 prompt,
-                converted_images,
+                images_data,
                 aspect_ratio,
                 image_size,
                 task_id,
@@ -228,16 +289,73 @@ class GeminiImageGenerator:
             last_error = result[1] or "生成失败"
 
             if attempt < self.max_retry_attempts - 1:
-                if len(self.api_keys) > 1:
-                    self._rotate_api_key()
+                await self._wait_before_retry(attempt)
 
-                # 如果是单 Key，或者已经轮询了一圈 Key，则进行退避等待
-                if (attempt + 1) % len(self.api_keys) == 0:
-                    round_index = (attempt + 1) // len(self.api_keys) - 1
-                    wait_time = min(2**round_index, 10)
-                    await asyncio.sleep(wait_time)
+        return None, last_error, []
 
-        return None, f"重试失败: {last_error}", []
+    async def _wait_before_retry(self, attempt: int):
+        """切换 API Key；单 Key 或已轮询一圈 Key 时退避等待"""
+        if len(self.api_keys) > 1:
+            self._rotate_api_key()
+
+        if (attempt + 1) % len(self.api_keys) == 0:
+            round_index = (attempt + 1) // len(self.api_keys) - 1
+            wait_time = min(2**round_index, 10)
+            await asyncio.sleep(wait_time)
+
+    @staticmethod
+    def _rotate_image_180(image_data: bytes) -> tuple[bytes, str]:
+        """按 EXIF 方向摆正后旋转 180 度，尽量保持原格式"""
+        with Image.open(BytesIO(image_data)) as img:
+            img_format = img.format
+            icc_profile = img.info.get("icc_profile")
+            rotated = ImageOps.exif_transpose(img).transpose(Image.Transpose.ROTATE_180)
+
+        save_kwargs = {"icc_profile": icc_profile} if icc_profile else {}
+        if img_format == "JPEG":
+            save_format, mime_type = "JPEG", "image/jpeg"
+            save_kwargs["quality"] = 95
+            if rotated.mode not in ("RGB", "L", "CMYK"):
+                rotated = rotated.convert("RGB")
+        elif img_format == "WEBP":
+            save_format, mime_type = "WEBP", "image/webp"
+            save_kwargs["quality"] = 95
+        else:
+            save_format, mime_type = "PNG", "image/png"
+
+        output = BytesIO()
+        rotated.save(output, format=save_format, **save_kwargs)
+        return output.getvalue(), mime_type
+
+    def _sync_rotate_images(
+        self, images_data: list[tuple[bytes, str]], prefix: str = ""
+    ) -> list[tuple[bytes, str]] | None:
+        """把所有参考图旋转 180 度，任意一张处理失败时返回 None"""
+        rotated_images = []
+        for image_data, _ in images_data:
+            try:
+                rotated_images.append(self._rotate_image_180(image_data))
+            except Exception as e:
+                logger.warning(
+                    f"[Gemini Image] {prefix}参考图旋转失败，跳过旋转重试: {e}"
+                )
+                return None
+        return rotated_images
+
+    def _sync_rotate_results(
+        self, images: list[bytes], prefix: str = ""
+    ) -> list[bytes]:
+        """把旋转重试生成的图片转回正向，转换失败的图片原样返回"""
+        restored = []
+        for image_data in images:
+            try:
+                restored.append(self._rotate_image_180(image_data)[0])
+            except Exception as e:
+                logger.warning(
+                    f"[Gemini Image] {prefix}生成图片转回失败，原样发送: {e}"
+                )
+                restored.append(image_data)
+        return restored
 
     def _resolve_search_types(self, prefix: str = "") -> tuple[str, ...]:
         """按当前接口和模型过滤联网搜索类型，不支持的类型不传"""
