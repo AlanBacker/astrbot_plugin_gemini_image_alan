@@ -338,6 +338,9 @@ class GeminiImagePlugin(Star):
         self.rotate_retry = self._as_bool(
             generate_config.get("rotate_retry", True), default=True
         )
+        self.notify_rotate_retry = self._as_bool(
+            generate_config.get("notify_rotate_retry", True), default=True
+        )
         self.safety_settings = generate_config.get("safety_settings", "BLOCK_NONE")
         self.max_image_size_mb = generate_config.get("max_image_size_mb", 10)
 
@@ -1023,6 +1026,18 @@ class GeminiImagePlugin(Star):
             lines.append(f"{idx}. {title} {uri}" if title else f"{idx}. {uri}")
         return "\n".join(lines)
 
+    async def _notify_rotate_retry(self, unified_msg_origin: str):
+        """提醒用户初次生成失败，正在旋转参考图尝试绕过"""
+        try:
+            await self.context.send_message(
+                unified_msg_origin,
+                MessageChain().message(
+                    "⚠️ 初次生成失败，正在旋转参考图尝试绕过，请稍候..."
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"[Gemini Image] 发送旋转重试提示失败: {e}")
+
     async def _generate_and_send_image_async(
         self,
         prompt: str,
@@ -1062,6 +1077,11 @@ class GeminiImagePlugin(Star):
                     image_size=resolution,
                     task_id=task_id,
                     thinking_level=final_thinking_level,
+                    on_rotate_retry=(
+                        (lambda: self._notify_rotate_retry(unified_msg_origin))
+                        if self.notify_rotate_retry
+                        else None
+                    ),
                 )
 
                 if error:

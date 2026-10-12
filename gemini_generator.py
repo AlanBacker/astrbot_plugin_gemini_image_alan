@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import re
+from collections.abc import Awaitable, Callable
 from io import BytesIO
 
 import aiohttp
@@ -185,8 +186,12 @@ class GeminiImageGenerator:
         image_size: str | None = None,
         task_id: str | None = None,
         thinking_level: str | None = None,
+        on_rotate_retry: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[list[bytes] | None, str | None, list[tuple[str, str]]]:
-        """生成图片，返回 (图片列表, 错误信息, 联网搜索来源 [(标题, 链接)])"""
+        """生成图片，返回 (图片列表, 错误信息, 联网搜索来源 [(标题, 链接)])
+
+        on_rotate_retry: 开始旋转参考图重试前调用，用于提醒用户
+        """
         logger.debug(
             f"[Gemini Image] generate_image params - Model: {self.model}, Aspect: {aspect_ratio}, Size: {image_size}, Thinking: {thinking_level}, Search: {self.search_types}, TaskID: {task_id}"
         )
@@ -228,6 +233,8 @@ class GeminiImageGenerator:
                 logger.info(
                     f"[Gemini Image] {prefix}常规重试均失败，将参考图旋转180度后再重试 {self.max_retry_attempts} 次"
                 )
+                if on_rotate_retry:
+                    await on_rotate_retry()
                 await self._wait_before_retry(self.max_retry_attempts - 1)
                 result = await self._generate_with_retries(
                     prompt,

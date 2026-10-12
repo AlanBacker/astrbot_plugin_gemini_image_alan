@@ -425,6 +425,111 @@ class RotateRetryTests(unittest.IsolatedAsyncioTestCase):
         # 用户看到的是红块在右下角的图，旋转 180 度后回到左上角
         self.assertEqual(red_corner(rotated), "左上")
 
+    async def test_notify_callback_runs_once_before_rotated_attempts(self):
+        generator, received = self.make_counting_generator(succeed_on=3)
+        notified_after = []
+
+        async def notify():
+            notified_after.append(len(received))
+
+        await generator.generate_image(
+            "改成水彩", [(make_marked_png(), "image/png")], on_rotate_retry=notify
+        )
+        self.assertEqual(notified_after, [3])
+
+        # 常规重试成功、关闭旋转重试、文生图时都不提醒
+        for succeed_on, rotate_retry, images in (
+            (1, True, [(make_marked_png(), "image/png")]),
+            (None, False, [(make_marked_png(), "image/png")]),
+            (None, True, None),
+        ):
+            generator, received = self.make_counting_generator(
+                succeed_on=succeed_on, rotate_retry=rotate_retry
+            )
+            notified_after.clear()
+            await generator.generate_image("改成水彩", images, on_rotate_retry=notify)
+            self.assertEqual(notified_after, [])
+
+    async def test_notify_message_is_sent_and_send_errors_are_swallowed(self):
+        module = ast.parse(Path("main.py").read_text(encoding="utf-8"))
+        plugin_class = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == "GeminiImagePlugin"
+        )
+        method = next(
+            node
+            for node in plugin_class.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_notify_rotate_retry"
+        )
+
+        class FakeChain:
+            def message(self, text):
+                self.text = text
+                return self
+
+        namespace = {
+            "MessageChain": FakeChain,
+            "logger": logging.getLogger("gemini_image_test"),
+        }
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
+                "<notify-rotate-retry>",
+                "exec",
+            ),
+            namespace,
+        )
+        notify = namespace["_notify_rotate_retry"]
+        sent = []
+
+        class FakeContext:
+            async def send_message(self, origin, chain):
+                sent.append((origin, chain.text))
+
+        plugin = types.SimpleNamespace(context=FakeContext())
+        await notify(plugin, "qq:GroupMessage:1")
+        self.assertEqual(
+            sent,
+            [
+                (
+                    "qq:GroupMessage:1",
+                    "⚠️ 初次生成失败，正在旋转参考图尝试绕过，请稍候...",
+                )
+            ],
+        )
+
+        class BrokenContext:
+            async def send_message(self, origin, chain):
+                raise RuntimeError("offline")
+
+        plugin.context = BrokenContext()
+        with self.assertLogs("gemini_image_test", level="WARNING"):
+            await notify(plugin, "qq:GroupMessage:1")
+
+    def test_notify_option_controls_callback(self):
+        schema = json.loads(Path("_conf_schema.json").read_text(encoding="utf-8-sig"))
+        option = schema["generate_config"]["items"]["notify_rotate_retry"]
+        self.assertEqual(option["type"], "bool")
+        self.assertIs(option["default"], True)
+
+        module = ast.parse(Path("main.py").read_text(encoding="utf-8"))
+        keyword = next(
+            k
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "generate_image"
+            for k in node.keywords
+            if k.arg == "on_rotate_retry"
+        )
+        # 关闭提醒时必须传 None，而不是返回 None 的函数
+        self.assertIsInstance(keyword.value, ast.IfExp)
+        self.assertEqual(ast.unparse(keyword.value.test), "self.notify_rotate_retry")
+        self.assertIsInstance(keyword.value.body, ast.Lambda)
+        self.assertIsNone(keyword.value.orelse.value)
+
     def test_rotate_retry_option_defaults_to_on(self):
         schema = json.loads(Path("_conf_schema.json").read_text(encoding="utf-8-sig"))
         option = schema["generate_config"]["items"]["rotate_retry"]
