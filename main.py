@@ -1029,14 +1029,15 @@ class GeminiImagePlugin(Star):
             lines.append(f"{idx}. {title} {uri}" if title else f"{idx}. {uri}")
         return "\n".join(lines)
 
-    async def _notify_rotate_retry(self, unified_msg_origin: str):
-        """提醒用户初次生成失败，正在旋转参考图尝试绕过"""
+    async def _notify_rotate_retry(self, unified_msg_origin: str, angle: int):
+        """提醒用户生成失败，正在旋转参考图尝试绕过；180 度是第一轮，之后换角度再试"""
+        if angle == 180:
+            text = "⚠️ 初次生成失败，正在旋转参考图尝试绕过，请稍候..."
+        else:
+            text = "⚠️ 旋转后仍未成功，正在换个角度再尝试绕过，请稍候..."
         try:
             await self.context.send_message(
-                unified_msg_origin,
-                MessageChain().message(
-                    "⚠️ 初次生成失败，正在旋转参考图尝试绕过，请稍候..."
-                ),
+                unified_msg_origin, MessageChain().message(text)
             )
         except Exception as e:
             logger.warning(f"[Gemini Image] 发送旋转重试提示失败: {e}")
@@ -1100,7 +1101,11 @@ class GeminiImagePlugin(Star):
                     task_id=task_id,
                     thinking_level=final_thinking_level,
                     on_rotate_retry=(
-                        (lambda: self._notify_rotate_retry(unified_msg_origin))
+                        (
+                            lambda angle: self._notify_rotate_retry(
+                                unified_msg_origin, angle
+                            )
+                        )
                         if self.notify_rotate_retry
                         else None
                     ),
@@ -1109,7 +1114,7 @@ class GeminiImagePlugin(Star):
             if error:
                 await self.context.send_message(
                     unified_msg_origin,
-                    MessageChain().message(f"❌ 生成失败: {error}"),
+                    MessageChain().message(f"❌ 图片生成失败：{error}"),
                 )
                 return
 
@@ -1136,7 +1141,9 @@ class GeminiImagePlugin(Star):
             if saved_image_count == 0:
                 await self.context.send_message(
                     unified_msg_origin,
-                    MessageChain().message("❌ 生成的图片保存失败"),
+                    MessageChain().message(
+                        "❌ 图片已生成，但保存临时文件失败，请联系管理员查看后台日志"
+                    ),
                 )
                 return
 
@@ -1170,7 +1177,9 @@ class GeminiImagePlugin(Star):
             logger.error(f"[Gemini Image] 任务失败: {e}", exc_info=True)
             await self.context.send_message(
                 unified_msg_origin,
-                MessageChain().message("❌ 生成过程中发生未知错误"),
+                MessageChain().message(
+                    "❌ 生成过程中出现意外错误，请稍后再试；一直出现的话请联系管理员查看后台日志"
+                ),
             )
         finally:
             if (

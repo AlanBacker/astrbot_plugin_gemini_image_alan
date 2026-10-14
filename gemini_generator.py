@@ -50,6 +50,103 @@ def get_supported_search_types(model: str) -> tuple[str, ...]:
     return ()
 
 
+# 参考图旋转重试的顺序：(顺时针角度, 参考图的旋转方式, 结果转回的方式)
+ROTATE_RETRY_STEPS = (
+    (180, Image.Transpose.ROTATE_180, Image.Transpose.ROTATE_180),
+    (90, Image.Transpose.ROTATE_270, Image.Transpose.ROTATE_90),
+)
+
+# Gemini 因安全审核或版权拦截而不出图时的 finishReason
+SAFETY_FINISH_REASONS = {
+    "SAFETY",
+    "PROHIBITED_CONTENT",
+    "BLOCKLIST",
+    "SPII",
+    "IMAGE_SAFETY",
+    "IMAGE_PROHIBITED_CONTENT",
+}
+RECITATION_FINISH_REASONS = {"RECITATION", "IMAGE_RECITATION"}
+
+# 中转接口审核拦截时，错误信息里常见的关键词
+MODERATION_KEYWORDS = (
+    "content_policy",
+    "content_filter",
+    "moderation",
+    "sensitive",
+    "prohibited",
+    "违规",
+    "敏感",
+)
+
+SAFETY_BLOCKED_MESSAGE = "内容没有通过安全审核，换个描述或图片再试试"
+
+
+class ApiResponseError(Exception):
+    """生图接口返回了非 200 状态码"""
+
+    def __init__(self, status: int, text: str):
+        super().__init__(f"HTTP {status}")
+        self.status = status
+        self.text = text
+
+
+def describe_http_error(status: int, text: str = "") -> str:
+    """把接口返回的 HTTP 错误转换成用户能看懂的说明"""
+    lowered = text.lower()
+    if "location is not supported" in lowered:
+        return "生图服务器所在地区不支持使用 Gemini，请联系管理员更换代理或接口地址"
+    if status == 401 or "api key not valid" in lowered or "api_key_invalid" in lowered:
+        return "API Key 无效，请联系管理员检查插件配置"
+    if any(keyword in lowered for keyword in MODERATION_KEYWORDS):
+        return SAFETY_BLOCKED_MESSAGE
+    if status == 403:
+        return "API Key 没有使用该模型的权限，请联系管理员检查插件配置"
+    if status == 404:
+        return "找不到配置的模型或接口地址，请联系管理员检查插件配置"
+    if status == 413:
+        return "参考图太大了，换张小一点的图片再试试"
+    if status == 429:
+        return "请求太频繁或 API 额度已用完，请稍后再试"
+    if status == 400:
+        return "请求被生图服务器拒绝，可能是图片格式不支持或参数有误，换张图片或调整参数再试试"
+    if status >= 500:
+        return "生图服务器繁忙或暂时出了故障，请稍后再试"
+    return f"生图服务器返回了错误（HTTP {status}），请稍后再试"
+
+
+def describe_request_error(error: BaseException) -> str:
+    """把请求生图接口时出现的异常转换成用户能看懂的说明"""
+    if isinstance(error, ApiResponseError):
+        return describe_http_error(error.status, error.text)
+    if isinstance(error, asyncio.TimeoutError):
+        return "生图服务器响应超时，请稍后再试"
+    if isinstance(error, aiohttp.ClientConnectionError):
+        return "连接不上生图服务器，可能是网络或代理有问题，请稍后再试"
+    if isinstance(error, (aiohttp.ContentTypeError, ValueError)):
+        return "生图服务器返回的内容无法识别，请联系管理员检查接口地址"
+    if isinstance(error, aiohttp.ClientError):
+        return "和生图服务器通信时出错，请稍后再试"
+    return "生成过程中出现异常，请稍后再试"
+
+
+def describe_no_image(
+    finish_reason: str | None, model_text: str = "", block_reason: str | None = None
+) -> str:
+    """说明接口返回成功但没有图片的原因"""
+    if block_reason or finish_reason in SAFETY_FINISH_REASONS:
+        return SAFETY_BLOCKED_MESSAGE
+    if finish_reason in RECITATION_FINISH_REASONS:
+        return "生成的内容疑似涉及版权，被拦截了，换个描述再试试"
+    if model_text:
+        text = " ".join(model_text.split())
+        if len(text) > 80:
+            text = text[:80] + "…"
+        return f"模型这次没有画出图片，换个描述再试试（模型回复：{text}）"
+    if finish_reason:
+        return "模型这次没有画出图片，换个描述再试试"
+    return "生图服务器没有返回图片，请稍后再试"
+
+
 class GeminiImageGenerator:
     """Gemini 图像生成器"""
 
@@ -186,17 +283,17 @@ class GeminiImageGenerator:
         image_size: str | None = None,
         task_id: str | None = None,
         thinking_level: str | None = None,
-        on_rotate_retry: Callable[[], Awaitable[None]] | None = None,
+        on_rotate_retry: Callable[[int], Awaitable[None]] | None = None,
     ) -> tuple[list[bytes] | None, str | None, list[tuple[str, str]]]:
         """生成图片，返回 (图片列表, 错误信息, 联网搜索来源 [(标题, 链接)])
 
-        on_rotate_retry: 开始旋转参考图重试前调用，用于提醒用户
+        on_rotate_retry: 每轮旋转参考图重试开始前以旋转角度调用，用于提醒用户
         """
         logger.debug(
             f"[Gemini Image] generate_image params - Model: {self.model}, Aspect: {aspect_ratio}, Size: {image_size}, Thinking: {thinking_level}, Search: {self.search_types}, TaskID: {task_id}"
         )
         if not self.api_keys:
-            return None, "未配置 API Key", []
+            return None, "未配置 API Key，请联系管理员在插件配置中填写", []
 
         prefix = f"[{task_id}] " if task_id else ""
         thinking_level = self._resolve_thinking_level(thinking_level, prefix)
@@ -224,17 +321,19 @@ class GeminiImageGenerator:
             return result
         last_error = result[1]
 
-        # 常规重试全部失败时，把参考图旋转 180 度再试同样次数，成功后把结果转回来
+        # 常规重试全部失败时，依次把原参考图旋转 180 度、90 度各再试同样次数，成功后把结果转回来
         if self.rotate_retry and converted_images:
-            rotated_images = await asyncio.to_thread(
-                self._sync_rotate_images, converted_images, prefix
-            )
-            if rotated_images:
+            for angle, transpose, restore in ROTATE_RETRY_STEPS:
+                rotated_images = await asyncio.to_thread(
+                    self._sync_rotate_images, converted_images, transpose, prefix
+                )
+                if not rotated_images:
+                    break
                 logger.info(
-                    f"[Gemini Image] {prefix}常规重试均失败，将参考图旋转180度后再重试 {self.max_retry_attempts} 次"
+                    f"[Gemini Image] {prefix}之前的重试均失败，将参考图旋转{angle}度后再重试 {self.max_retry_attempts} 次"
                 )
                 if on_rotate_retry:
-                    await on_rotate_retry()
+                    await on_rotate_retry(angle)
                 await self._wait_before_retry(self.max_retry_attempts - 1)
                 result = await self._generate_with_retries(
                     prompt,
@@ -244,16 +343,16 @@ class GeminiImageGenerator:
                     task_id,
                     thinking_level,
                     search_types,
-                    rotated=True,
+                    rotation=angle,
                 )
                 if result[0] is not None:
                     images = await asyncio.to_thread(
-                        self._sync_rotate_results, result[0], prefix
+                        self._sync_rotate_results, result[0], restore, prefix
                     )
                     return images, None, result[2]
                 last_error = result[1]
 
-        return None, f"重试失败: {last_error}", []
+        return None, last_error, []
 
     async def _generate_with_retries(
         self,
@@ -264,16 +363,16 @@ class GeminiImageGenerator:
         task_id: str | None,
         thinking_level: str | None,
         search_types: tuple[str, ...],
-        rotated: bool = False,
+        rotation: int = 0,
     ) -> tuple[list[bytes] | None, str | None, list[tuple[str, str]]]:
         """按最大重试次数尝试生成，全部失败时返回最后一次的错误信息"""
         prefix = f"[{task_id}] " if task_id else ""
-        last_error = "生成失败"
+        last_error = "生成失败，请稍后再试"
 
         for attempt in range(self.max_retry_attempts):
-            if rotated:
+            if rotation:
                 logger.info(
-                    f"[Gemini Image] {prefix}参考图旋转180度后重试 (第 {attempt + 1}/{self.max_retry_attempts} 次)"
+                    f"[Gemini Image] {prefix}参考图旋转{rotation}度后重试 (第 {attempt + 1}/{self.max_retry_attempts} 次)"
                 )
             elif attempt > 0:
                 logger.info(
@@ -293,7 +392,7 @@ class GeminiImageGenerator:
             if result[0] is not None:
                 return result
 
-            last_error = result[1] or "生成失败"
+            last_error = result[1] or "生成失败，请稍后再试"
 
             if attempt < self.max_retry_attempts - 1:
                 await self._wait_before_retry(attempt)
@@ -311,12 +410,14 @@ class GeminiImageGenerator:
             await asyncio.sleep(wait_time)
 
     @staticmethod
-    def _rotate_image_180(image_data: bytes) -> tuple[bytes, str]:
-        """按 EXIF 方向摆正后旋转 180 度，尽量保持原格式"""
+    def _rotate_image(
+        image_data: bytes, transpose: Image.Transpose
+    ) -> tuple[bytes, str]:
+        """按 EXIF 方向摆正后旋转，尽量保持原格式"""
         with Image.open(BytesIO(image_data)) as img:
             img_format = img.format
             icc_profile = img.info.get("icc_profile")
-            rotated = ImageOps.exif_transpose(img).transpose(Image.Transpose.ROTATE_180)
+            rotated = ImageOps.exif_transpose(img).transpose(transpose)
 
         save_kwargs = {"icc_profile": icc_profile} if icc_profile else {}
         if img_format == "JPEG":
@@ -335,13 +436,16 @@ class GeminiImageGenerator:
         return output.getvalue(), mime_type
 
     def _sync_rotate_images(
-        self, images_data: list[tuple[bytes, str]], prefix: str = ""
+        self,
+        images_data: list[tuple[bytes, str]],
+        transpose: Image.Transpose,
+        prefix: str = "",
     ) -> list[tuple[bytes, str]] | None:
-        """把所有参考图旋转 180 度，任意一张处理失败时返回 None"""
+        """旋转所有参考图，任意一张处理失败时返回 None"""
         rotated_images = []
         for image_data, _ in images_data:
             try:
-                rotated_images.append(self._rotate_image_180(image_data))
+                rotated_images.append(self._rotate_image(image_data, transpose))
             except Exception as e:
                 logger.warning(
                     f"[Gemini Image] {prefix}参考图旋转失败，跳过旋转重试: {e}"
@@ -350,13 +454,13 @@ class GeminiImageGenerator:
         return rotated_images
 
     def _sync_rotate_results(
-        self, images: list[bytes], prefix: str = ""
+        self, images: list[bytes], transpose: Image.Transpose, prefix: str = ""
     ) -> list[bytes]:
         """把旋转重试生成的图片转回正向，转换失败的图片原样返回"""
         restored = []
         for image_data in images:
             try:
-                restored.append(self._rotate_image_180(image_data)[0])
+                restored.append(self._rotate_image(image_data, transpose)[0])
             except Exception as e:
                 logger.warning(
                     f"[Gemini Image] {prefix}生成图片转回失败，原样发送: {e}"
@@ -487,26 +591,17 @@ class GeminiImageGenerator:
                 session, payload, endpoint_type, task_id, provider="OpenAI"
             )
 
-            if response_data is None:
-                return None, "API 请求失败"
-
             images = await self._extract_openai_chat_image(response_data)
             if images:
                 return images, None
 
-            # 尝试提取文本错误信息
-            if "choices" in response_data and response_data["choices"]:
-                content = response_data["choices"][0].get("message", {}).get("content")
-                if content and isinstance(content, str):
-                    return None, f"未生成图片，API返回文本: {content[:100]}"
+            return None, self._describe_openai_no_image(response_data, prefix)
 
-            return None, "响应中未找到图片数据"
-
-        except asyncio.TimeoutError:
-            return None, "生成超时"
+        except ApiResponseError as e:
+            return None, describe_http_error(e.status, e.text)
         except Exception as e:
-            logger.error(f"[Gemini Image] {prefix}OpenAI 生成失败: {e}")
-            return None, f"生成失败: {str(e)}"
+            logger.error(f"[Gemini Image] {prefix}OpenAI 生成失败: {e!r}")
+            return None, describe_request_error(e)
 
     def _build_openai_chat_payload(
         self,
@@ -599,8 +694,27 @@ class GeminiImageGenerator:
                 logger.error(
                     f"[Gemini Image] {prefix}{provider} API 错误: {response.status} - {error_preview}"
                 )
-                return None
+                raise ApiResponseError(response.status, error_text)
             return await response.json()
+
+    def _describe_openai_no_image(self, response_data: dict | None, prefix: str) -> str:
+        """说明 OpenAI 兼容接口为什么没有返回图片"""
+        choices = (
+            response_data.get("choices") if isinstance(response_data, dict) else None
+        )
+        choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        finish_reason = choice.get("finish_reason")
+        content = (choice.get("message") or {}).get("content")
+        model_text = content if isinstance(content, str) else ""
+        logger.warning(
+            f"[Gemini Image] {prefix}接口未返回图片 (finish_reason: {finish_reason}, 文本: {model_text[:200]})"
+        )
+        if finish_reason == "content_filter":
+            return SAFETY_BLOCKED_MESSAGE
+        if not choice:
+            return describe_no_image(None)
+        # 部分中转会原样透传 Gemini 的 finishReason（如 SAFETY）
+        return describe_no_image(str(finish_reason or "STOP").upper(), model_text)
 
     async def _download_image_from_url(self, url: str) -> bytes | None:
         """从 URL 下载图片"""
@@ -756,27 +870,18 @@ class GeminiImageGenerator:
                 session, payload, endpoint_type, task_id, provider="Zai"
             )
 
-            if response_data is None:
-                return None, "API 请求失败"
-
             # 尝试使用 OpenAI 兼容的提取逻辑
             images = await self._extract_openai_chat_image(response_data)
             if images:
                 return images, None
 
-            # 尝试提取文本错误信息
-            if "choices" in response_data and response_data["choices"]:
-                content = response_data["choices"][0].get("message", {}).get("content")
-                if content and isinstance(content, str):
-                    return None, f"未生成图片，API返回文本: {content[:100]}"
+            return None, self._describe_openai_no_image(response_data, prefix)
 
-            return None, "响应中未找到图片数据"
-
-        except asyncio.TimeoutError:
-            return None, "生成超时"
+        except ApiResponseError as e:
+            return None, describe_http_error(e.status, e.text)
         except Exception as e:
-            logger.error(f"[Gemini Image] {prefix}Zai 生成失败: {e}")
-            return None, f"生成失败: {str(e)}"
+            logger.error(f"[Gemini Image] {prefix}Zai 生成失败: {e!r}")
+            return None, describe_request_error(e)
 
     def _build_zai_payload(
         self,
@@ -854,21 +959,19 @@ class GeminiImageGenerator:
 
             session = self._get_session()
             response_data = await self._make_gemini_request(session, payload, task_id)
-            if response_data is None:
-                return None, "API 请求失败", []
 
             result_image_data = self._extract_gemini_image(response_data, task_id)
             if result_image_data:
                 sources = self._extract_grounding_sources(response_data, task_id)
                 return result_image_data, None, sources
 
-            return None, "响应中未找到图片数据", []
+            return None, self._describe_gemini_no_image(response_data, prefix), []
 
-        except asyncio.TimeoutError:
-            return None, "生成超时", []
+        except ApiResponseError as e:
+            return None, describe_http_error(e.status, e.text), []
         except Exception as e:
-            logger.error(f"[Gemini Image] {prefix}Gemini 生成失败: {e}")
-            return None, f"生成失败: {str(e)}", []
+            logger.error(f"[Gemini Image] {prefix}Gemini 生成失败: {e!r}")
+            return None, describe_request_error(e), []
 
     def _build_gemini_payload(
         self,
@@ -975,10 +1078,28 @@ class GeminiImageGenerator:
                 logger.error(
                     f"[Gemini Image] {prefix}Gemini API 错误: {response.status} - {error_preview}"
                 )
-                if response.status in [401, 403, 429]:
-                    return None
-                return None
+                raise ApiResponseError(response.status, error_text)
             return await response.json()
+
+    def _describe_gemini_no_image(self, response: dict | None, prefix: str) -> str:
+        """说明 Gemini 为什么没有返回图片"""
+        if not isinstance(response, dict):
+            response = {}
+        block_reason = (response.get("promptFeedback") or {}).get("blockReason")
+        candidates = response.get("candidates") or []
+        candidate = candidates[0] if candidates else {}
+        finish_reason = candidate.get("finishReason")
+        model_text = " ".join(
+            part["text"]
+            for part in (candidate.get("content") or {}).get("parts") or []
+            if isinstance(part.get("text"), str) and not part.get("thought")
+        )
+        logger.warning(
+            f"[Gemini Image] {prefix}接口未返回图片 (blockReason: {block_reason}, finishReason: {finish_reason}, 文本: {model_text[:200]})"
+        )
+        if candidate and not finish_reason:
+            finish_reason = "STOP"
+        return describe_no_image(finish_reason, model_text, block_reason)
 
     def _extract_gemini_image(
         self, response: dict, task_id: str | None = None

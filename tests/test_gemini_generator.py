@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import base64
 import json
 import logging
@@ -22,12 +23,21 @@ if "astrbot.api" not in sys.modules:
     sys.modules.setdefault("astrbot.api", astrbot_api_module)
 
 try:
-    import aiohttp  # noqa: F401
+    import aiohttp
 except ImportError:
-    sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+    aiohttp = types.ModuleType("aiohttp")
+    aiohttp.ClientError = type("ClientError", (Exception,), {})
+    aiohttp.ClientConnectionError = type(
+        "ClientConnectionError", (aiohttp.ClientError,), {}
+    )
+    aiohttp.ContentTypeError = type("ContentTypeError", (aiohttp.ClientError,), {})
+    sys.modules["aiohttp"] = aiohttp
 
 from gemini_generator import (
+    ApiResponseError,
     GeminiImageGenerator,
+    describe_http_error,
+    describe_request_error,
     get_supported_search_types,
     get_supported_thinking_levels,
 )
@@ -374,6 +384,26 @@ class RotateRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(red_corner(images[0]), "左上")
         self.assertEqual(sources, [("来源", "https://a.example")])
 
+    async def test_quarter_turn_retry_after_half_turn_fails(self):
+        generator, received = self.make_counting_generator(succeed_on=6)
+        image = make_marked_png()
+
+        images, error, _ = await generator.generate_image(
+            "改成水彩", [(image, "image/png")]
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(len(received), 7)
+        self.assertTrue(all(red_corner(r[0][0]) == "右下" for r in received[3:6]))
+        # 第7次请求收到的是原图顺时针旋转 90 度后的竖图，左上角的红块转到了右上角
+        with Image.open(BytesIO(received[6][0][0])) as quarter:
+            self.assertEqual(quarter.size, (20, 40))
+        self.assertEqual(red_corner(received[6][0][0]), "右上")
+        # 返回给用户的图片已经转回原方向
+        with Image.open(BytesIO(images[0])) as restored:
+            self.assertEqual(restored.size, (40, 20))
+        self.assertEqual(red_corner(images[0]), "左上")
+
     async def test_rotated_retry_uses_same_attempt_count(self):
         generator, received = self.make_counting_generator(succeed_on=None)
 
@@ -382,8 +412,8 @@ class RotateRetryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(images)
-        self.assertEqual(len(received), 6)
-        self.assertEqual(error, "重试失败: 第6次失败")
+        self.assertEqual(len(received), 9)
+        self.assertEqual(error, "第9次失败")
 
     async def test_no_rotated_retry_when_disabled_or_text_only(self):
         generator, received = self.make_counting_generator(
@@ -393,7 +423,7 @@ class RotateRetryTests(unittest.IsolatedAsyncioTestCase):
             "改成水彩", [(make_marked_png(), "image/png")]
         )
         self.assertEqual(len(received), 3)
-        self.assertEqual(error, "重试失败: 第3次失败")
+        self.assertEqual(error, "第3次失败")
 
         generator, received = self.make_counting_generator(succeed_on=None)
         await generator.generate_image("画猫")
@@ -408,7 +438,7 @@ class RotateRetryTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(len(received), 3)
-        self.assertEqual(error, "重试失败: 第3次失败")
+        self.assertEqual(error, "第3次失败")
 
     def test_rotation_keeps_jpeg_and_follows_exif_orientation(self):
         exif = Image.Exif()
@@ -416,7 +446,9 @@ class RotateRetryTests(unittest.IsolatedAsyncioTestCase):
         output = BytesIO()
         make_marked_image().save(output, format="JPEG", quality=95, exif=exif)
 
-        rotated, mime_type = GeminiImageGenerator._rotate_image_180(output.getvalue())
+        rotated, mime_type = GeminiImageGenerator._rotate_image(
+            output.getvalue(), Image.Transpose.ROTATE_180
+        )
 
         self.assertEqual(mime_type, "image/jpeg")
         with Image.open(BytesIO(rotated)) as result:
@@ -425,17 +457,23 @@ class RotateRetryTests(unittest.IsolatedAsyncioTestCase):
         # 用户看到的是红块在右下角的图，旋转 180 度后回到左上角
         self.assertEqual(red_corner(rotated), "左上")
 
-    async def test_notify_callback_runs_once_before_rotated_attempts(self):
-        generator, received = self.make_counting_generator(succeed_on=3)
+    async def test_notify_callback_runs_before_each_rotation_round(self):
         notified_after = []
+        for succeed_on, expected in (
+            (3, [(180, 3)]),
+            (6, [(180, 3), (90, 6)]),
+            (None, [(180, 3), (90, 6)]),
+        ):
+            generator, received = self.make_counting_generator(succeed_on=succeed_on)
 
-        async def notify():
-            notified_after.append(len(received))
+            async def notify(angle, received=received):
+                notified_after.append((angle, len(received)))
 
-        await generator.generate_image(
-            "改成水彩", [(make_marked_png(), "image/png")], on_rotate_retry=notify
-        )
-        self.assertEqual(notified_after, [3])
+            notified_after.clear()
+            await generator.generate_image(
+                "改成水彩", [(make_marked_png(), "image/png")], on_rotate_retry=notify
+            )
+            self.assertEqual(notified_after, expected)
 
         # 常规重试成功、关闭旋转重试、文生图时都不提醒
         for succeed_on, rotate_retry, images in (
@@ -447,6 +485,10 @@ class RotateRetryTests(unittest.IsolatedAsyncioTestCase):
                 succeed_on=succeed_on, rotate_retry=rotate_retry
             )
             notified_after.clear()
+
+            async def notify(angle):
+                notified_after.append(angle)
+
             await generator.generate_image("改成水彩", images, on_rotate_retry=notify)
             self.assertEqual(notified_after, [])
 
@@ -489,14 +531,19 @@ class RotateRetryTests(unittest.IsolatedAsyncioTestCase):
                 sent.append((origin, chain.text))
 
         plugin = types.SimpleNamespace(context=FakeContext())
-        await notify(plugin, "qq:GroupMessage:1")
+        await notify(plugin, "qq:GroupMessage:1", 180)
+        await notify(plugin, "qq:GroupMessage:1", 90)
         self.assertEqual(
             sent,
             [
                 (
                     "qq:GroupMessage:1",
                     "⚠️ 初次生成失败，正在旋转参考图尝试绕过，请稍候...",
-                )
+                ),
+                (
+                    "qq:GroupMessage:1",
+                    "⚠️ 旋转后仍未成功，正在换个角度再尝试绕过，请稍候...",
+                ),
             ],
         )
 
@@ -506,7 +553,7 @@ class RotateRetryTests(unittest.IsolatedAsyncioTestCase):
 
         plugin.context = BrokenContext()
         with self.assertLogs("gemini_image_test", level="WARNING"):
-            await notify(plugin, "qq:GroupMessage:1")
+            await notify(plugin, "qq:GroupMessage:1", 180)
 
     def test_notify_option_controls_callback(self):
         schema = json.loads(Path("_conf_schema.json").read_text(encoding="utf-8-sig"))
@@ -528,6 +575,7 @@ class RotateRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(keyword.value, ast.IfExp)
         self.assertEqual(ast.unparse(keyword.value.test), "self.notify_rotate_retry")
         self.assertIsInstance(keyword.value.body, ast.Lambda)
+        self.assertEqual([arg.arg for arg in keyword.value.body.args.args], ["angle"])
         self.assertIsNone(keyword.value.orelse.value)
 
     def test_rotate_retry_option_defaults_to_on(self):
@@ -549,6 +597,159 @@ class RotateRetryTests(unittest.IsolatedAsyncioTestCase):
             "rotate_retry=self.rotate_retry",
             [ast.unparse(k) for k in calls[0].keywords],
         )
+
+
+class ErrorMessageTests(unittest.IsolatedAsyncioTestCase):
+    def test_http_errors_are_explained(self):
+        cases = [
+            (401, "", "API Key 无效"),
+            (
+                400,
+                '{"message": "API key not valid. Please pass a valid API key."}',
+                "API Key 无效",
+            ),
+            (
+                400,
+                '{"message": "User location is not supported for the API use."}',
+                "地区不支持",
+            ),
+            (403, "PERMISSION_DENIED", "没有使用该模型的权限"),
+            (404, "models/foo is not found", "找不到配置的模型"),
+            (413, "", "参考图太大"),
+            (429, "RESOURCE_EXHAUSTED", "额度已用完"),
+            (500, "Internal error encountered.", "服务器繁忙"),
+            (503, "The model is overloaded.", "服务器繁忙"),
+            (400, "Request contains an invalid argument.", "请求被生图服务器拒绝"),
+            # 安全设置参数错误不能当成审核拦截
+            (
+                400,
+                "Invalid value at 'safety_settings[4].threshold'",
+                "请求被生图服务器拒绝",
+            ),
+            (400, '{"error": {"code": "content_policy_violation"}}', "安全审核"),
+            (418, "", "HTTP 418"),
+        ]
+        for status, text, expected in cases:
+            with self.subTest(status=status, text=text):
+                self.assertIn(expected, describe_http_error(status, text))
+
+    def test_request_exceptions_are_explained(self):
+        cases = [
+            (ApiResponseError(429, ""), "额度已用完"),
+            (asyncio.TimeoutError(), "响应超时"),
+            (aiohttp.ClientConnectionError("refused"), "连接不上生图服务器"),
+            (ValueError("Expecting value"), "无法识别"),
+            (aiohttp.ClientError("payload"), "通信时出错"),
+            (KeyError("x"), "出现异常"),
+        ]
+        for error, expected in cases:
+            with self.subTest(error=error):
+                self.assertIn(expected, describe_request_error(error))
+
+    async def run_gemini(self, response=None, error=None):
+        generator = make_generator("gemini-nano-banana-2.1")
+
+        async def fake_request(session, payload, task_id=None):
+            if error:
+                raise error
+            return response
+
+        generator._get_session = lambda: None
+        generator._make_gemini_request = fake_request
+        return await generator._generate_gemini("画猫", [], "1:1", "1K")
+
+    async def test_gemini_no_image_reasons(self):
+        cases = [
+            ({"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}}, "安全审核"),
+            ({"candidates": [{"finishReason": "IMAGE_SAFETY"}]}, "安全审核"),
+            ({"candidates": [{"finishReason": "RECITATION"}]}, "版权"),
+            (
+                {
+                    "candidates": [
+                        {
+                            "finishReason": "STOP",
+                            "content": {
+                                "parts": [
+                                    {"thought": True, "text": "thinking"},
+                                    {"text": "I can't draw\nthat person."},
+                                ]
+                            },
+                        }
+                    ]
+                },
+                "模型这次没有画出图片，换个描述再试试（模型回复：I can't draw that person.）",
+            ),
+            ({"candidates": [{"finishReason": "NO_IMAGE"}]}, "模型这次没有画出图片"),
+            ({"candidates": []}, "生图服务器没有返回图片"),
+        ]
+        for response, expected in cases:
+            with (
+                self.subTest(response=response),
+                self.assertLogs("gemini_image_test", level="WARNING"),
+            ):
+                images, error, _ = await self.run_gemini(response=response)
+                self.assertIsNone(images)
+                self.assertIn(expected, error)
+
+    async def test_gemini_http_error_is_explained(self):
+        images, error, _ = await self.run_gemini(
+            error=ApiResponseError(429, "RESOURCE_EXHAUSTED")
+        )
+        self.assertIsNone(images)
+        self.assertEqual(error, "请求太频繁或 API 额度已用完，请稍后再试")
+
+        with self.assertLogs("gemini_image_test", level="ERROR"):
+            images, error, _ = await self.run_gemini(error=asyncio.TimeoutError())
+        self.assertEqual(error, "生图服务器响应超时，请稍后再试")
+
+    async def test_openai_no_image_reasons(self):
+        generator = make_generator("gemini-nano-banana-2.1", api_type="openai")
+        responses = iter(
+            [
+                {"choices": [{"finish_reason": "content_filter", "message": {}}]},
+                {"choices": [{"finish_reason": "SAFETY", "message": {}}]},
+                {"choices": [{"message": {"content": "抱歉，我无法生成这张图片"}}]},
+                {"choices": []},
+            ]
+        )
+
+        async def fake_request(session, payload, endpoint_type, task_id, provider):
+            return next(responses)
+
+        generator._get_session = lambda: None
+        generator._make_openai_request = fake_request
+        expected = [
+            "安全审核",
+            "安全审核",
+            "（模型回复：抱歉，我无法生成这张图片）",
+            "生图服务器没有返回图片",
+        ]
+        for text in expected:
+            with self.assertLogs("gemini_image_test", level="WARNING"):
+                images, error = await generator._generate_openai(
+                    "画猫", [], "1:1", "1K"
+                )
+            self.assertIsNone(images)
+            self.assertIn(text, error)
+
+    async def test_final_error_has_no_technical_prefix(self):
+        generator = make_generator("gemini-nano-banana-2.1")
+
+        async def fake_try(*args):
+            return None, "生图服务器繁忙或暂时出了故障，请稍后再试", []
+
+        async def no_wait(attempt):
+            return None
+
+        generator._try_generate_with_current_key = fake_try
+        generator._wait_before_retry = no_wait
+
+        _, error, _ = await generator.generate_image("画猫")
+        self.assertEqual(error, "生图服务器繁忙或暂时出了故障，请稍后再试")
+
+        generator.api_keys = []
+        _, error, _ = await generator.generate_image("画猫")
+        self.assertIn("请联系管理员", error)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,9 @@ import unittest
 from pathlib import Path
 
 SEND_FAILED_TEXT = "❌ 图片已生成，但发送失败（可能是网络问题），请稍后重试"
+UNEXPECTED_ERROR_TEXT = (
+    "❌ 生成过程中出现意外错误，请稍后再试；一直出现的话请联系管理员查看后台日志"
+)
 
 
 class FakeChain:
@@ -91,8 +94,12 @@ class SendRetryTests(unittest.IsolatedAsyncioTestCase):
         test = self
 
         class FakeGenerator:
+            result = ([b"cat"], None, [])
+
             async def generate_image(self, **kwargs):
-                return [b"cat"], None, []
+                if isinstance(self.result, Exception):
+                    raise self.result
+                return self.result
 
         class FakeContext:
             async def send_message(self, origin, chain):
@@ -155,6 +162,38 @@ class SendRetryTests(unittest.IsolatedAsyncioTestCase):
         await self.run_task(plugin)
 
         self.assertEqual(self.semaphore_held, [False, False])
+
+    async def test_generation_error_is_shown_with_readable_reason(self):
+        plugin = self.make_plugin(image_failures=0)
+        plugin.generator.result = (None, "请求太频繁或 API 额度已用完，请稍后再试", [])
+
+        await plugin._generate_and_send_image_async(
+            "画猫",
+            "qq:GroupMessage:1",
+            rate_limit_subject_id="group:1",
+            rate_limit_request_id="req",
+        )
+
+        self.assertEqual(
+            self.sent,
+            [("text", "❌ 图片生成失败：请求太频繁或 API 额度已用完，请稍后再试")],
+        )
+        self.assertEqual(self.finished, [False])
+
+    async def test_unexpected_error_tells_user_to_retry_or_ask_admin(self):
+        plugin = self.make_plugin(image_failures=0)
+        plugin.generator.result = KeyError("boom")
+
+        with self.assertLogs("gemini_image_send_test", level="ERROR"):
+            await plugin._generate_and_send_image_async(
+                "画猫",
+                "qq:GroupMessage:1",
+                rate_limit_subject_id="group:1",
+                rate_limit_request_id="req",
+            )
+
+        self.assertEqual(self.sent, [("text", UNEXPECTED_ERROR_TEXT)])
+        self.assertEqual(self.finished, [False])
 
 
 if __name__ == "__main__":
