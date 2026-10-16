@@ -65,6 +65,7 @@ class RateLimitAdminTests(unittest.IsolatedAsyncioTestCase):
                 "hour": 1,
                 "day": 3,
                 "pending": 0,
+                "reserved": 0,
                 "next_release": 1000 + RateLimitStore.WINDOW_SECONDS,
             },
         )
@@ -625,7 +626,7 @@ class EntrypointTests(unittest.TestCase):
                 node
                 for node in _plugin_class(module).body
                 if isinstance(node, ast.AsyncFunctionDef)
-                and node.name == "generate_image_command"
+                and node.name == "_run_generate_command"
             ),
         ]
         for entrypoint in entrypoints:

@@ -115,7 +115,12 @@ class SendRetryTests(unittest.IsolatedAsyncioTestCase):
         async def finish(subject, request_id, successful):
             test.finished.append(successful)
 
+        async def quota_note(subject, cost):
+            return self.quota_note
+
+        self.quota_note = None
         plugin.generator = FakeGenerator()
+        plugin._format_remaining_quota = quota_note
         plugin.context = FakeContext()
         plugin._finish_rate_limit_request = finish
         plugin._record_session_success = self.recorded.append
@@ -162,6 +167,35 @@ class SendRetryTests(unittest.IsolatedAsyncioTestCase):
         await self.run_task(plugin)
 
         self.assertEqual(self.semaphore_held, [False, False])
+
+    async def test_sources_and_remaining_quota_follow_image(self):
+        plugin = self.make_plugin(image_failures=0)
+        plugin.generator.result = ([b"cat"], None, [("天气网", "https://w.example")])
+        plugin._format_grounding_sources = lambda sources: "🔎 参考来源:\n1. 天气网"
+        self.quota_note = "📊 本次消耗 2 次额度，本群剩余 7/10 次（滚动24小时）"
+        texts = []
+
+        async def send(origin, chain):
+            texts.append(chain.texts)
+
+        plugin.context.send_message = send
+
+        await plugin._generate_and_send_image_async(
+            "画猫",
+            "qq:GroupMessage:1",
+            rate_limit_subject_id="group:1",
+            rate_limit_request_id="req",
+            quota_cost=2,
+        )
+
+        self.assertEqual(
+            texts,
+            [
+                [
+                    "🔎 参考来源:\n1. 天气网\n📊 本次消耗 2 次额度，本群剩余 7/10 次（滚动24小时）"
+                ]
+            ],
+        )
 
     async def test_generation_error_is_shown_with_readable_reason(self):
         plugin = self.make_plugin(image_failures=0)

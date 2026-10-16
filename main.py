@@ -236,6 +236,8 @@ class GeminiImagePlugin(Star):
     # 图片发送失败时的总尝试次数和重试间隔（秒，逐次递增）
     SEND_RETRY_ATTEMPTS = 3
     SEND_RETRY_DELAY = 3
+    # 高清生图可选的分辨率
+    HD_RESOLUTIONS = ("1K", "2K", "4K")
 
     # 可用模型列表
     AVAILABLE_MODELS = [
@@ -550,10 +552,19 @@ class GeminiImagePlugin(Star):
         )
         return enabled, minute_limit, hour_limit, day_limit
 
+    def _get_hd_settings(self) -> tuple[str, int]:
+        """读取高清生图的分辨率和每次消耗的额度份数，保存配置后立即生效"""
+        generate_config = self.config.get("generate_config", {})
+        resolution = str(generate_config.get("hd_resolution", "2K")).strip().upper()
+        if resolution not in self.HD_RESOLUTIONS:
+            resolution = "2K"
+        cost = self._positive_int(generate_config.get("hd_quota_cost", 2), 2)
+        return resolution, cost
+
     async def _reserve_rate_limit(
-        self, subject_id: str, request_id: str
+        self, subject_id: str, request_id: str, cost: int = 1
     ) -> tuple[bool, str, bool]:
-        """按群或私聊用户主体统一预留额度。"""
+        """按群或私聊用户主体统一预留额度，高清生图一次预留 cost 份。"""
         enabled, minute_limit, hour_limit, day_limit = self._get_rate_limit_settings()
         is_allowed, message = await self.rate_limit_store.reserve(
             subject_id,
@@ -562,8 +573,26 @@ class GeminiImagePlugin(Star):
             minute_limit=minute_limit,
             hour_limit=hour_limit,
             day_limit=day_limit,
+            cost=cost,
         )
         return is_allowed, message, enabled
+
+    async def _format_remaining_quota(self, subject_id: str, cost: int) -> str | None:
+        """本次消耗和剩余额度的提示（本次任务已计入），关闭显示或读取失败时返回 None"""
+        generate_config = self.config.get("generate_config", {})
+        if not self._as_bool(
+            generate_config.get("show_remaining_quota", True), default=True
+        ):
+            return None
+        enabled, _, _, day_limit = self._get_rate_limit_settings()
+        if not enabled:
+            return None
+        snapshot, _ = await self.rate_limit_store.snapshot(subject_id)
+        if snapshot is None:
+            return None
+        remaining = max(0, day_limit - snapshot["day"] - snapshot["reserved"])
+        scope = "本群" if subject_id.startswith("group:") else ""
+        return f"📊 本次消耗 {cost} 次额度，{scope}剩余 {remaining}/{day_limit} 次（滚动24小时）"
 
     async def _finish_rate_limit_request(
         self, subject_id: str, request_id: str, successful: bool
@@ -604,6 +633,18 @@ class GeminiImagePlugin(Star):
     @filter.command("生图")
     async def generate_image_command(self, event: AstrMessageEvent):
         """生成图片指令"""
+        async for result in self._run_generate_command(event):
+            yield result
+
+    @filter.command("高清生图")
+    async def generate_hd_image_command(self, event: AstrMessageEvent):
+        """高清生图指令：使用配置的高清分辨率，按倍数消耗额度"""
+        async for result in self._run_generate_command(event, hd=True):
+            yield result
+
+    async def _run_generate_command(self, event: AstrMessageEvent, hd: bool = False):
+        """生图和高清生图指令共用的流程"""
+        command_name = "高清生图" if hd else "生图"
         user_id = self._get_event_user_id(event)
         group_id = self._get_event_group_id(event)
 
@@ -619,7 +660,7 @@ class GeminiImagePlugin(Star):
 
         user_input = (event.message_str or "").strip()
         logger.info(
-            f"[Gemini Image] 收到生图指令 - 用户: {masked_uid}, 原始输入: {user_input}"
+            f"[Gemini Image] 收到{command_name}指令 - 用户: {masked_uid}, 原始输入: {user_input}"
         )
 
         # 移除指令前缀
@@ -689,6 +730,11 @@ class GeminiImagePlugin(Star):
             yield event.plain_result("❌ 请提供图片生成的提示词或预设名称！")
             return
 
+        # 高清生图固定使用配置的分辨率（覆盖预设），每次消耗多份额度
+        quota_cost = 1
+        if hd:
+            resolution, quota_cost = self._get_hd_settings()
+
         # 获取参考图片
         images_data = await self._get_reference_images_for_command(event)
 
@@ -697,14 +743,14 @@ class GeminiImagePlugin(Star):
         rate_limit_subject_id = self._get_rate_limit_subject(user_id, group_id)
         self._register_session(event, rate_limit_subject_id, user_id)
         is_allowed, rate_msg, rate_limit_enabled = await self._reserve_rate_limit(
-            rate_limit_subject_id, task_id
+            rate_limit_subject_id, task_id, cost=quota_cost
         )
         if not is_allowed:
             yield event.plain_result(rate_msg)
             return
 
         # 发送确认
-        msg = "已开始生图任务"
+        msg = f"已开始高清生图任务[{resolution}]" if hd else "已开始生图任务"
         if images_data:
             msg += f"[{len(images_data)}张参考图]"
         if matched_preset:
@@ -739,6 +785,7 @@ class GeminiImagePlugin(Star):
                         rate_limit_subject_id if rate_limit_enabled else None
                     ),
                     rate_limit_request_id=task_id if rate_limit_enabled else None,
+                    quota_cost=quota_cost,
                 )
             )
         except Exception:
@@ -769,12 +816,14 @@ class GeminiImagePlugin(Star):
             return
 
         scope_label = "当前群" if group_id else "当前用户"
+        hd_resolution, hd_cost = self._get_hd_settings()
         yield event.plain_result(
             f"📊 {scope_label}生图额度（仅统计成功发送的图片）\n"
             f"最近1分钟: {snapshot['minute']}/{minute_limit}\n"
             f"最近1小时: {snapshot['hour']}/{hour_limit}\n"
             f"滚动24小时: {snapshot['day']}/{day_limit}\n"
-            f"正在执行: {snapshot['pending']}"
+            f"正在执行: {snapshot['pending']}\n"
+            f"高清生图（{hd_resolution}）每次消耗 {hd_cost} 次额度"
         )
 
     async def _fetch_images_from_event(
@@ -1072,6 +1121,7 @@ class GeminiImagePlugin(Star):
         session_subject_id: str | None = None,
         rate_limit_subject_id: str | None = None,
         rate_limit_request_id: str | None = None,
+        quota_cost: int = 1,
     ):
         """异步生成图片并发送"""
         if not task_id:
@@ -1148,8 +1198,18 @@ class GeminiImagePlugin(Star):
                 return
 
             # 使用了联网搜索时，随图片附上来源网页链接
+            notes = []
             if sources and self.show_grounding_sources:
-                chain.message(self._format_grounding_sources(sources))
+                notes.append(self._format_grounding_sources(sources))
+            # 附上本次消耗和剩余额度
+            if rate_limit_subject_id:
+                quota_note = await self._format_remaining_quota(
+                    rate_limit_subject_id, quota_cost
+                )
+                if quota_note:
+                    notes.append(quota_note)
+            if notes:
+                chain.message("\n".join(notes))
 
             send_error = await self._send_image_with_retry(
                 unified_msg_origin, chain, task_id
@@ -1272,6 +1332,7 @@ class GeminiImagePlugin(Star):
             "hour": 0,
             "day": 0,
             "pending": 0,
+            "reserved": 0,
             "next_release": None,
         }
         sessions = []

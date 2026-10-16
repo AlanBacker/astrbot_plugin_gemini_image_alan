@@ -158,7 +158,27 @@ class RateLimitStore:
                 del pending[user_id]
 
     @staticmethod
-    def _limit_message(period: str, limit: int) -> str:
+    def _request_keys(request_id: str, cost: int) -> list[str]:
+        """一个任务按消耗的额度份数占位：第一份用任务 ID，其余份加 #序号"""
+        return [request_id] + [f"{request_id}#{index}" for index in range(2, cost + 1)]
+
+    @staticmethod
+    def _is_request_key(key: str, request_id: str) -> bool:
+        return key == request_id or key.startswith(f"{request_id}#")
+
+    @staticmethod
+    def _pending_tasks(requests: dict[str, float]) -> int:
+        return sum(1 for key in requests if "#" not in key)
+
+    @staticmethod
+    def _limit_message(period: str, limit: int, used: int = 0, cost: int = 1) -> str:
+        if cost > 1 and used < limit:
+            label = {"minute": "最近1分钟", "hour": "最近1小时", "day": "滚动24小时"}[
+                period
+            ]
+            return (
+                f"❌ 额度不足：本次需要 {cost} 次额度，{label}内只剩 {limit - used} 次"
+            )
         if period == "minute":
             return f"❌ 请求过于频繁，请稍后再试 (每分钟限 {limit} 次)"
         if period == "hour":
@@ -179,8 +199,10 @@ class RateLimitStore:
         minute_limit: int,
         hour_limit: int,
         day_limit: int,
+        cost: int = 1,
         now: float | None = None,
     ) -> tuple[bool, str]:
+        """为一次生图预留 cost 份额度，任一时间窗口剩余不足时拒绝"""
         if not enabled:
             return True, ""
         if self._storage_error:
@@ -189,6 +211,7 @@ class RateLimitStore:
         now = time.time() if now is None else now
         user_id = str(user_id).strip()
         request_id = str(request_id).strip()
+        cost = max(1, int(cost))
 
         async with self._async_lock:
             try:
@@ -209,11 +232,15 @@ class RateLimitStore:
                         "day": day_limit,
                     }
                     for period in ("minute", "hour", "day"):
-                        if counts[period] >= limits[period]:
+                        if counts[period] + cost > limits[period]:
                             self._write_state(state)
-                            return False, self._limit_message(period, limits[period])
+                            return False, self._limit_message(
+                                period, limits[period], counts[period], cost
+                            )
 
-                    state["pending"].setdefault(user_id, {})[request_id] = now
+                    requests = state["pending"].setdefault(user_id, {})
+                    for key in self._request_keys(request_id, cost):
+                        requests[key] = now
                     self._write_state(state)
                     return True, ""
             except Exception as exc:
@@ -245,11 +272,17 @@ class RateLimitStore:
                         self._write_state(state)
                         return False
 
-                    del requests[request_id]
+                    keys = [
+                        key for key in requests if self._is_request_key(key, request_id)
+                    ]
+                    for key in keys:
+                        del requests[key]
                     if not requests:
                         state["pending"].pop(user_id, None)
                     if successful:
-                        state["successful"].setdefault(user_id, []).append(now)
+                        state["successful"].setdefault(user_id, []).extend(
+                            [now] * len(keys)
+                        )
                     self._write_state(state)
                     return True
             except Exception as exc:
@@ -276,7 +309,9 @@ class RateLimitStore:
                         "minute": sum(now - value < 60 for value in successful),
                         "hour": sum(now - value < 3600 for value in successful),
                         "day": len(successful),
-                        "pending": len(pending),
+                        # pending 是正在执行的任务数，reserved 是它们占用的额度份数
+                        "pending": self._pending_tasks(pending),
+                        "reserved": len(pending),
                     }, ""
             except Exception as exc:
                 self._storage_error = str(exc)
@@ -302,11 +337,13 @@ class RateLimitStore:
         result: dict[str, dict[str, Any]] = {}
         for user_id in set(state["successful"]) | set(state["pending"]):
             successful = state["successful"].get(user_id, [])
+            pending = state["pending"].get(user_id, {})
             result[user_id] = {
                 "minute": sum(now - value < 60 for value in successful),
                 "hour": sum(now - value < 3600 for value in successful),
                 "day": len(successful),
-                "pending": len(state["pending"].get(user_id, {})),
+                "pending": self._pending_tasks(pending),
+                "reserved": len(pending),
                 # 最早一条记录过期的时间，即下一次自动恢复额度的时间
                 "next_release": (
                     min(successful) + self.WINDOW_SECONDS if successful else None

@@ -160,7 +160,7 @@ function renderStats() {
 
   const cards = [
     ["会话", sessions.length, `群聊 ${groups} · 私聊 ${sessions.length - groups}`],
-    ["近24小时成功生图", used, pending ? `正在执行 ${pending}` : "仅统计成功发送的图片"],
+    ["近24小时已用额度", used, pending ? `正在执行 ${pending}` : "仅统计成功发送的图片"],
     [
       "频率限制",
       limits.enabled ? `${limits.day} 次 / 24小时` : "未启用",
@@ -196,7 +196,7 @@ function visibleSessions() {
   const query = state.query.trim().toLowerCase();
   const sortKey = {
     recent: (item) => item.last_seen || 0,
-    day: (item) => item.usage.day + item.usage.pending,
+    day: (item) => item.usage.day + item.usage.reserved,
     total: (item) => item.total_success || 0,
   }[state.sort];
   return state.data.sessions
@@ -240,8 +240,9 @@ function permissionButton(session, mode) {
   return "";
 }
 
-function windowCount(used, pending, limit) {
-  const full = used + pending >= limit;
+// reserved 是正在执行的任务占用的额度份数（高清生图一次占多份）
+function windowCount(used, reserved, limit) {
+  const full = used + reserved >= limit;
   return `<span class="count${full ? " full" : ""}">${used}<span class="limit"> / ${limit}</span></span>`;
 }
 
@@ -249,7 +250,7 @@ function renderRow(session) {
   const { limits, permission_mode: mode } = state.data;
   const usage = session.usage;
   const percent = Math.min(100, (usage.day / limits.day) * 100);
-  const barClass = usage.day + usage.pending >= limits.day ? "full" : percent >= 80 ? "warn" : "";
+  const barClass = usage.day + usage.reserved >= limits.day ? "full" : percent >= 80 ? "warn" : "";
 
   const meta = [`ID ${session.target_id}`];
   if (session.platform) meta.push(session.platform);
@@ -276,11 +277,11 @@ function renderRow(session) {
         </div>
       </div>
       <div><span class="cell-label">权限</span>${permissionCell(session, mode)}</div>
-      <div><span class="cell-label">最近1分钟</span>${windowCount(usage.minute, usage.pending, limits.minute)}</div>
-      <div><span class="cell-label">最近1小时</span>${windowCount(usage.hour, usage.pending, limits.hour)}</div>
+      <div><span class="cell-label">最近1分钟</span>${windowCount(usage.minute, usage.reserved, limits.minute)}</div>
+      <div><span class="cell-label">最近1小时</span>${windowCount(usage.hour, usage.reserved, limits.hour)}</div>
       <div class="day-cell">
         <span class="cell-label">滚动24小时</span>
-        ${windowCount(usage.day, usage.pending, limits.day)}
+        ${windowCount(usage.day, usage.reserved, limits.day)}
         <div class="bar"><span class="${barClass}" style="width: ${percent}%"></span></div>
         <div class="usage-sub">${usageSub.join(" · ")}</div>
       </div>
@@ -354,7 +355,7 @@ function editUsage(session) {
   openDialog({
     title: "修改已用次数",
     body: `
-      <p>${esc(displayName(session))} 在滚动24小时内已成功生图 <b>${session.usage.day}</b> 次，上限 ${limits.day} 次。</p>
+      <p>${esc(displayName(session))} 在滚动24小时内已用 <b>${session.usage.day}</b> 次额度，上限 ${limits.day} 次（高清生图一次按倍数计）。</p>
       <div class="stepper">
         <button type="button" class="btn" data-step="-1" aria-label="减一">−</button>
         <input type="number" class="input" id="used-input" min="0" max="${MAX_USED}" step="1"

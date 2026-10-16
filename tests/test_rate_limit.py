@@ -34,6 +34,89 @@ class RateLimitStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot["day"], 0)
             self.assertEqual(snapshot["pending"], 0)
 
+    async def test_hd_request_needs_enough_quota_for_its_cost(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = RateLimitStore(Path(temp_dir))
+            limits = {"enabled": True, "minute_limit": 100, "hour_limit": 100}
+
+            # 先用掉 2 次：普通生图 1 次 + 失败的高清生图不计
+            allowed, _ = await store.reserve(
+                "user", "n1", day_limit=4, now=1000, **limits
+            )
+            self.assertTrue(allowed)
+            await store.finish("user", "n1", successful=True, now=1000)
+            allowed, _ = await store.reserve(
+                "user", "hd-fail", day_limit=4, cost=2, now=1001, **limits
+            )
+            self.assertTrue(allowed)
+            await store.finish("user", "hd-fail", successful=False, now=1002)
+            snapshot, _ = await store.snapshot("user", now=1002)
+            self.assertEqual(
+                (snapshot["day"], snapshot["pending"], snapshot["reserved"]), (1, 0, 0)
+            )
+
+            # 剩 3 次时高清生图占 2 份，执行中只算 1 个任务
+            allowed, _ = await store.reserve(
+                "user", "hd", day_limit=4, cost=2, now=1003, **limits
+            )
+            self.assertTrue(allowed)
+            snapshot, _ = await store.snapshot("user", now=1003)
+            self.assertEqual(
+                (snapshot["day"], snapshot["pending"], snapshot["reserved"]), (1, 1, 2)
+            )
+
+            # 只剩 1 份时，第二个高清生图被拒，普通生图还能用
+            allowed, message = await store.reserve(
+                "user", "hd2", day_limit=4, cost=2, now=1004, **limits
+            )
+            self.assertFalse(allowed)
+            self.assertEqual(
+                message, "❌ 额度不足：本次需要 2 次额度，滚动24小时内只剩 1 次"
+            )
+
+            self.assertTrue(await store.finish("user", "hd", successful=True, now=1005))
+            snapshot, _ = await store.snapshot("user", now=1005)
+            self.assertEqual(
+                (snapshot["day"], snapshot["pending"], snapshot["reserved"]), (3, 0, 0)
+            )
+
+            allowed, _ = await store.reserve(
+                "user", "n2", day_limit=4, now=1006, **limits
+            )
+            self.assertTrue(allowed)
+            await store.finish("user", "n2", successful=True, now=1006)
+
+            # 额度全部用完时，提示与普通生图相同
+            allowed, message = await store.reserve(
+                "user", "hd3", day_limit=4, cost=2, now=1007, **limits
+            )
+            self.assertFalse(allowed)
+            self.assertIn("今日成功生图次数已达上限", message)
+
+    async def test_hd_cost_also_counts_against_minute_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = RateLimitStore(Path(temp_dir))
+            limits = {
+                "enabled": True,
+                "minute_limit": 3,
+                "hour_limit": 30,
+                "day_limit": 100,
+            }
+
+            allowed, _ = await store.reserve("user", "hd", cost=2, now=1000, **limits)
+            self.assertTrue(allowed)
+            allowed, message = await store.reserve(
+                "user", "hd2", cost=2, now=1001, **limits
+            )
+            self.assertFalse(allowed)
+            self.assertEqual(
+                message, "❌ 额度不足：本次需要 2 次额度，最近1分钟内只剩 1 次"
+            )
+            # 一分钟后高清生图的记录不再计入每分钟限制
+            await store.finish("user", "hd", successful=True, now=1001)
+            allowed, _ = await store.reserve("user", "hd3", cost=2, now=1062, **limits)
+            self.assertTrue(allowed)
+
     async def test_successful_quota_survives_restart_and_blocks_request_21(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir)
@@ -204,9 +287,7 @@ class RateLimitStoreTests(unittest.IsolatedAsyncioTestCase):
                 now=5001,
             )
             self.assertTrue(allowed, message)
-            await store.finish(
-                "group:B", "group-success", successful=True, now=5001
-            )
+            await store.finish("group:B", "group-success", successful=True, now=5001)
 
             private_snapshot, _ = await store.snapshot("A", now=5002)
             group_snapshot, _ = await store.snapshot("group:B", now=5002)
@@ -328,8 +409,24 @@ class EntrypointCoverageTests(unittest.TestCase):
             node
             for node in plugin_class.body
             if isinstance(node, ast.AsyncFunctionDef)
-            and node.name == "generate_image_command"
+            and node.name == "_run_generate_command"
         )
+        # 生图和高清生图指令都走同一个流程
+        for name in ("generate_image_command", "generate_hd_image_command"):
+            command = next(
+                node
+                for node in plugin_class.body
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == name
+            )
+            self.assertIn(
+                "_run_generate_command",
+                {
+                    node.func.attr
+                    for node in ast.walk(command)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                },
+            )
 
         for entrypoint in (tool_call, command_call):
             awaited_methods = {
@@ -343,8 +440,7 @@ class EntrypointCoverageTests(unittest.TestCase):
             called_methods = {
                 node.func.attr
                 for node in ast.walk(entrypoint)
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             }
             self.assertIn("_get_rate_limit_subject", called_methods)
 
@@ -365,8 +461,7 @@ class EntrypointCoverageTests(unittest.TestCase):
         called_methods = {
             node.func.attr
             for node in ast.walk(status_command)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         }
         self.assertIn("_check_permission", called_methods)
         self.assertIn("_get_rate_limit_subject", called_methods)
@@ -427,8 +522,7 @@ class EntrypointCoverageTests(unittest.TestCase):
 
         async def collect_results():
             return [
-                result
-                async for result in plugin.rate_limit_status_command(FakeEvent())
+                result async for result in plugin.rate_limit_status_command(FakeEvent())
             ]
 
         results = asyncio.run(collect_results())

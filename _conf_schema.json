@@ -117,7 +117,18 @@
       },
       "default_resolution": {
         "description": "默认分辨率",
-        "hint": "使用命令生图时默认使用的图片分辨率,仅 Gemini 3 系列和 Nano Banana 2.1 模型支持",
+        "hint": "使用“生图”指令时默认使用的图片分辨率（“高清生图”指令另有设置）,仅 Gemini 3 系列和 Nano Banana 2.1 模型支持",
+        "type": "string",
+        "default": "1K",
+        "options": [
+          "1K",
+          "2K",
+          "4K"
+        ]
+      },
+      "hd_resolution": {
+        "description": "高清生图分辨率",
+        "hint": "“高清生图”指令使用的分辨率（会覆盖预设里的分辨率）,仅 Gemini 3 系列和 Nano Banana 2.1 模型支持",
         "type": "string",
         "default": "2K",
         "options": [
@@ -125,6 +136,12 @@
           "2K",
           "4K"
         ]
+      },
+      "hd_quota_cost": {
+        "description": "高清生图额度倍数",
+        "hint": "每次“高清生图”消耗几次额度（普通生图消耗1次）。Nano Banana 2.1 的 2K 价格约为 1K 的两倍，所以默认是2。剩余额度不够时无法高清生图，比如只剩1次时不能生成2倍的高清图",
+        "type": "int",
+        "default": 2
       },
       "thinking_level": {
         "description": "思考等级",
@@ -182,9 +199,15 @@
       },
       "max_requests_per_day": {
         "description": "每天最大请求数",
-        "hint": "单个用户滚动 24 小时内最多成功生成的图片请求数；记录持久化，重启不会清零",
+        "hint": "单个用户滚动 24 小时内最多成功生成的图片请求数（高清生图按倍数计）；记录持久化，重启不会清零",
         "type": "int",
         "default": 100
+      },
+      "show_remaining_quota": {
+        "description": "显示剩余额度",
+        "hint": "每次生图成功后，在图片后附上本次消耗和当前群/用户剩余的额度（滚动24小时）。需开启速率限制",
+        "type": "bool",
+        "default": true
       },
       "max_image_size_mb": {
         "description": "最大图片大小(MB)",
